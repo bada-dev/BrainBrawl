@@ -68,8 +68,7 @@ Options: A)55° B)60° C)65° D)70° E)75°  Answer: E
 Explanation: Angle ABE=60°, ABC=90°, so EBC=30°. Triangle EBC is isosceles (BE=AB=BC), so BCE=(180-30)/2=75°. ECD=BCD-BCE=90-75=15°... wait, angle ECD = 15°. Actually: BCD=90°, BCE=75°, so ECD=15°.
 
 Q: "How many integers n satisfy the inequality n⁴ < 100?"
-Options: A)3 B)5 C)7 D)9 E)11  Answer: C
-Explanation: n⁴<100 means |n|<√√100=√10≈3.16, so n∈{-3,-2,-1,0,1,2,3} = 7 integers
+Options: A)3 B)5 C)7 D)9 E)11  Answer: C (7 integers: -3 to 3 inclusive)
 
 Q: "A rectangle has perimeter 56cm. One side is 6cm longer than the other. What is the area?"
 Options: A)144 B)154 C)160 D)170 E)176  Answer: B
@@ -168,9 +167,13 @@ def generate_question():
             temperature=0.8,
             max_tokens=1000
         )
+        
         raw = response.choices[0].message.content.strip()
+        # Extract JSON if model wrapped it in text
+        if '{' in raw:
+            raw = raw[raw.index('{'):raw.rindex('}')+1]
         data = json.loads(raw)
-
+        
         conn = get_db()
         conn.execute('''INSERT OR IGNORE INTO questions 
             (date, question, option_a, option_b, option_c, option_d, option_e, answer, explanation, level)
