@@ -91,7 +91,7 @@ def generate_question():
     level = pick_level()
     try:
         response = client.chat.completions.create(
-            model="llama3-70b-8192",
+            model="llama-3.3-70b-versatile",
             messages=[{"role": "user", "content": UKMT_PROMPT.format(level=level)}],
             temperature=0.8,
             max_tokens=1000
