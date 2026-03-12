@@ -1,2 +1,3 @@
 # BrainBrawl
-Imagine everything has a Project/[everything after] static/StudyBuddyImg.png static/manifest.json static/sw.js  templates/index.html  Procfile/  INSIDE>"web: gunicorn main:app"  README.md/  main.py/  requirements.txt/ in ^: flask==3.0.3 gunicorn==22.0.0  runtime.txt in ^: python-3.11.9
+
+© 2026 BrainBrawl. All rights reserved. No part of this software may be copied, modified, shared, or distributed in any form without explicit written permission from the author.
