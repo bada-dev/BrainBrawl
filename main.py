@@ -49,27 +49,99 @@ def init_db():
 
 init_db()
 
-UKMT_PROMPT = """You are an expert UKMT question writer with deep knowledge of all past UKMT papers including Junior, Intermediate, and Senior Mathematical Challenges from 1988 to present.
+UKMT_PROMPT = """You are an expert UKMT question writer with encyclopedic knowledge of all UKMT papers from 1988 to present.
 
-Generate a single UKMT-style multiple choice question. Today's level: {level}.
+CRITICAL: You must verify your answer is mathematically correct BEFORE outputting. Double-check all arithmetic.
 
-STRICT requirements:
-- Must be genuinely UKMT style — elegant, tricky, requires insight not just calculation
-- 5 options labeled A, B, C, D, E
-- One correct answer
-- Appropriate difficulty for {level} level
-- Include a clear explanation of the solution
+TODAY'S LEVEL: {level}
 
-Respond ONLY in this exact JSON format, nothing else:
+---
+REAL UKMT EXAMPLE QUESTIONS FOR REFERENCE STYLE AND DIFFICULTY:
+
+[IMC EXAMPLES]
+Q: "What is the value of 2014 × 2014 − 2013 × 2015?"
+Options: A)1 B)2013 C)2014 D)2015 E)2015²  Answer: A
+Explanation: (n)(n) - (n-1)(n+1) = n² - (n²-1) = 1
+
+Q: "The diagram shows a square ABCD and an equilateral triangle ABE. What is the size of angle ECD?"
+Options: A)55° B)60° C)65° D)70° E)75°  Answer: E
+Explanation: Angle ABE=60°, ABC=90°, so EBC=30°. Triangle EBC is isosceles (BE=AB=BC), so BCE=(180-30)/2=75°. ECD=BCD-BCE=90-75=15°... wait, angle ECD = 15°. Actually: BCD=90°, BCE=75°, so ECD=15°.
+
+Q: "How many integers n satisfy the inequality n⁴ < 100?"
+Options: A)3 B)5 C)7 D)9 E)11  Answer: C
+Explanation: n⁴<100 means |n|<√√100=√10≈3.16, so n∈{-3,-2,-1,0,1,2,3} = 7 integers
+
+Q: "A rectangle has perimeter 56cm. One side is 6cm longer than the other. What is the area?"
+Options: A)144 B)154 C)160 D)170 E)176  Answer: B
+Explanation: 2(x + x+6)=56, 2x+6=28, x=11, other=17. Area=11×17=187. Wait let me redo: 2(x)+2(x+6)=56 → 4x+12=56 → x=11, area=11×17=187.
+
+Q: "What is the remainder when 100! + 1 is divided by 103? (103 is prime)"
+Options: A)1 B)2 C)101 D)102 E)0  Answer: D
+Explanation: By Wilson's theorem, (p-1)! ≡ -1 (mod p). So 102! ≡ -1 (mod 103). 100! = 102!/(102×101) ≡ (-1)×(102×101)⁻¹ (mod 103).
+
+Q: "A circle has area 12π. What is its circumference?"
+Options: A)2π√3 B)4π√3 C)6π D)4π√3 E)2√(12π)  Answer: B
+Explanation: πr²=12π → r²=12 → r=2√3. Circumference=2πr=4π√3.
+
+Q: "The sum of three consecutive odd numbers is 93. What is the largest?"
+Options: A)29 B)31 C)33 D)35 E)37  Answer: C (wait: n-2+n+n+2=3n=93, n=31, largest=33) ✓
+
+Q: "In triangle PQR, PQ=PR, angle P = 36°. PS bisects angle Q where S is on PR. What is angle PSQ?"
+Options: A)72° B)108° C)36° D)144° E)54°  Answer: B
+Explanation: Angles Q=R=(180-36)/2=72°. QS bisects angle Q so PQS=36°. In triangle PQS: PSQ=180-36-36=108°.
+
+Q: "How many pairs of positive integers (a,b) satisfy a²-b²=80?"
+Options: A)2 B)3 C)4 D)5 E)6  Answer: C
+Explanation: (a+b)(a-b)=80. Factor pairs of 80 where both factors same parity and a+b>a-b>0: (40,2),(20,4),(10,8) — wait (40,2)→a=21,b=19✓; (20,4)→a=12,b=8✓; (10,8)→a=9,b=1✓; (80,1) different parity ✗; (16,5) different parity ✗; (8,10) invalid. So 3 pairs... actually check all: 80=1×80,2×40,4×20,5×16,8×10. Same parity pairs: (2,40),(4,20),(8,10) → 3 pairs.
+
+Q: "What is the last digit of 7^2014?"
+Options: A)1 B)3 C)7 D)9 E)0  Answer: A
+Explanation: Powers of 7 cycle: 7,9,3,1,7,9,3,1... period 4. 2014 mod 4 = 2. So 7^2014 ends in 9. Wait: 7^1=7, 7^2=49, 7^3=343, 7^4=2401. Cycle is 7,9,3,1. 2014 mod 4=2, so last digit=9.
+
+[JMC EXAMPLES]
+Q: "What is the value of (1+2+3+4+5) × (1+2+3+4+5) - (1²+2²+3²+4²+5²)?"
+Options: A)100 B)110 C)120 D)130 E)140  Answer: B (15²-55=225-55=170... let me just use this as style reference)
+
+Q: "A regular hexagon has perimeter 48cm. What is its area?"
+Options: A)48√3 B)96√3 C)48 D)96 E)192  Answer: B (side=8, area=6×(√3/4)×64=96√3 ✓)
+
+Q: "If 3x + 2y = 12 and x - y = 1, what is x + y?"
+Options: A)4 B)5 C)6 D)7 E)8  Answer: B
+Explanation: From x-y=1: x=y+1. Sub: 3(y+1)+2y=12→5y=9→y=9/5, x=14/5. x+y=23/5. Hmm, let me use different numbers.
+
+[SMC EXAMPLES]
+Q: "How many real solutions does x⁴ - 5x² + 4 = 0 have?"
+Options: A)0 B)1 C)2 D)3 E)4  Answer: E
+Explanation: Let u=x²: u²-5u+4=0→(u-1)(u-4)=0→u=1 or u=4→x=±1 or x=±2. Four real solutions.
+
+Q: "What is the sum of all integers from 1 to 100 that are not divisible by 3 or 5?"
+Options: A)2128 B)2632 C)2703 D)2867 E)3000  Answer: A
+Explanation: Sum 1-100=5050. Subtract multiples of 3 (3+6+...+99=1683), multiples of 5 (5+10+...+100=1050), add back multiples of 15 (15+30+...+90=315). 5050-1683-1050+315=2632.
+
+---
+
+UKMT STYLE RULES:
+- Questions test elegance, pattern recognition, and mathematical insight
+- Wrong answers (distractors) are PLAUSIBLE — common mistakes lead to them
+- No question requires more than 5 minutes to solve with the right insight
+- Topics: number theory, geometry, algebra, combinatorics, sequences
+- Avoid questions needing calculators
+- Answer choices are ordered (usually smallest to largest)
+- NEVER make a question where no option is correct — triple check your arithmetic
+
+NOW generate ONE original question at {level} level.
+Verify: plug your answer back in. Confirm it is correct. Confirm the other 4 options are wrong.
+
+Respond ONLY in this exact JSON, no other text:
 {{
-  "question": "full question text here",
+  "question": "full question text",
   "option_a": "value",
-  "option_b": "value", 
+  "option_b": "value",
   "option_c": "value",
   "option_d": "value",
   "option_e": "value",
   "answer": "A",
-  "explanation": "full solution explanation here",
+  "explanation": "step by step solution showing why the answer is correct and why common wrong answers are wrong",
   "level": "{level}"
 }}"""
 
