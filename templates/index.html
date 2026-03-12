@@ -1,1 +1,436 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<link rel="manifest" href="/static/manifest.json">
+<meta name="theme-color" content="#1a1a2e">
+<title>Daily UKMT</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
 
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+  min-height: 100vh;
+  color: white;
+  padding: 20px;
+}
+
+.container {
+  max-width: 600px;
+  margin: 0 auto;
+}
+
+.header {
+  text-align: center;
+  padding: 30px 0 20px;
+}
+
+.header h1 {
+  font-size: 28px;
+  font-weight: 800;
+  background: linear-gradient(135deg, #FFD700, #FFA500);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  margin-bottom: 6px;
+}
+
+.header p {
+  font-size: 13px;
+  opacity: 0.6;
+}
+
+.level-badge {
+  display: inline-block;
+  padding: 4px 12px;
+  border-radius: 20px;
+  font-size: 11px;
+  font-weight: 700;
+  margin-bottom: 14px;
+  background: rgba(255,215,0,0.2);
+  color: #FFD700;
+  border: 1px solid rgba(255,215,0,0.3);
+}
+
+.card {
+  background: rgba(255,255,255,0.05);
+  backdrop-filter: blur(10px);
+  border-radius: 20px;
+  padding: 24px;
+  margin-bottom: 16px;
+  border: 1px solid rgba(255,255,255,0.1);
+}
+
+.card-title {
+  font-size: 13px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  opacity: 0.5;
+  margin-bottom: 14px;
+}
+
+.question-text {
+  font-size: 17px;
+  line-height: 1.6;
+  margin-bottom: 20px;
+  font-weight: 500;
+}
+
+.options {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-bottom: 20px;
+}
+
+.option {
+  padding: 14px 16px;
+  background: rgba(255,255,255,0.05);
+  border: 2px solid rgba(255,255,255,0.1);
+  border-radius: 12px;
+  cursor: pointer;
+  transition: all 0.2s;
+  font-size: 15px;
+  font-weight: 500;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.option:active { transform: scale(0.98); }
+
+.option.selected {
+  border-color: #FFD700;
+  background: rgba(255,215,0,0.1);
+}
+
+.option-letter {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: rgba(255,255,255,0.1);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+
+.option.selected .option-letter {
+  background: #FFD700;
+  color: #1a1a2e;
+}
+
+.input-group {
+  margin-bottom: 12px;
+}
+
+.input-label {
+  font-size: 12px;
+  font-weight: 700;
+  opacity: 0.6;
+  margin-bottom: 6px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.input-field {
+  width: 100%;
+  padding: 13px 16px;
+  background: rgba(255,255,255,0.07);
+  border: 2px solid rgba(255,255,255,0.1);
+  border-radius: 12px;
+  color: white;
+  font-size: 15px;
+  font-family: inherit;
+  transition: border 0.2s;
+}
+
+.input-field:focus {
+  outline: none;
+  border-color: #FFD700;
+}
+
+.input-field::placeholder { opacity: 0.4; }
+
+.submit-btn {
+  width: 100%;
+  padding: 16px;
+  background: linear-gradient(135deg, #FFD700, #FFA500);
+  border: none;
+  border-radius: 14px;
+  font-size: 16px;
+  font-weight: 800;
+  color: #1a1a2e;
+  cursor: pointer;
+  transition: all 0.2s;
+  margin-top: 8px;
+}
+
+.submit-btn:active { transform: scale(0.97); }
+.submit-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.submitted-banner {
+  text-align: center;
+  padding: 20px;
+}
+
+.submitted-banner .big { font-size: 48px; margin-bottom: 10px; }
+.submitted-banner h3 { font-size: 20px; font-weight: 700; margin-bottom: 6px; }
+.submitted-banner p { font-size: 13px; opacity: 0.6; }
+
+.yesterday-answer {
+  font-size: 18px;
+  font-weight: 800;
+  color: #FFD700;
+  margin-bottom: 8px;
+}
+
+.explanation {
+  font-size: 14px;
+  line-height: 1.6;
+  opacity: 0.8;
+}
+
+.leaderboard-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 0;
+  border-bottom: 1px solid rgba(255,255,255,0.05);
+}
+
+.leaderboard-row:last-child { border-bottom: none; }
+
+.lb-rank { font-size: 18px; width: 30px; text-align: center; }
+.lb-name { flex: 1; font-weight: 600; font-size: 14px; }
+.lb-score { font-size: 13px; opacity: 0.6; }
+.lb-correct { font-weight: 700; color: #6BCF7F; }
+
+.loading { text-align: center; padding: 40px; opacity: 0.5; }
+
+.tabs {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 20px;
+}
+
+.tab {
+  flex: 1;
+  padding: 12px;
+  background: rgba(255,255,255,0.05);
+  border: 2px solid rgba(255,255,255,0.1);
+  border-radius: 12px;
+  color: white;
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: all 0.2s;
+  text-align: center;
+}
+
+.tab.active {
+  background: rgba(255,215,0,0.15);
+  border-color: #FFD700;
+  color: #FFD700;
+}
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="header">
+    <h1>📐 Daily UKMT</h1>
+    <p id="dateDisplay"></p>
+  </div>
+
+  <div class="tabs">
+    <div class="tab active" onclick="showTab('question')">Today</div>
+    <div class="tab" onclick="showTab('yesterday')">Yesterday's Answer</div>
+    <div class="tab" onclick="showTab('leaderboard')">Leaderboard</div>
+  </div>
+
+  <!-- TODAY TAB -->
+  <div id="tab-question">
+    <div class="card" id="questionCard">
+      <div class="loading">Loading today's question...</div>
+    </div>
+  </div>
+
+  <!-- YESTERDAY TAB -->
+  <div id="tab-yesterday" style="display:none;">
+    <div class="card" id="yesterdayCard">
+      <div class="loading">Loading...</div>
+    </div>
+  </div>
+
+  <!-- LEADERBOARD TAB -->
+  <div id="tab-leaderboard" style="display:none;">
+    <div class="card">
+      <div class="card-title">🏆 Top Players</div>
+      <div id="leaderboardList"><div class="loading">Loading...</div></div>
+    </div>
+  </div>
+</div>
+
+<script>
+let todayData = null;
+let yesterdayData = null;
+let selectedAnswer = null;
+const today = new Date().toISOString().split('T')[0];
+
+document.getElementById('dateDisplay').textContent = new Date().toLocaleDateString('en-GB', {weekday:'long', year:'numeric', month:'long', day:'numeric'});
+
+function showTab(tab) {
+  ['question','yesterday','leaderboard'].forEach(t => {
+    document.getElementById(`tab-${t}`).style.display = t === tab ? 'block' : 'none';
+  });
+  document.querySelectorAll('.tab').forEach((el, i) => {
+    el.classList.toggle('active', ['question','yesterday','leaderboard'][i] === tab);
+  });
+  if (tab === 'leaderboard') loadLeaderboard();
+}
+
+function hasSubmittedToday() {
+  return localStorage.getItem(`submitted-${today}`) === '1';
+}
+
+async function loadQuestion() {
+  try {
+    const res = await fetch('/question');
+    const data = await res.json();
+    todayData = data.today;
+    yesterdayData = data.yesterday;
+    renderQuestion();
+    renderYesterday();
+  } catch {
+    document.getElementById('questionCard').innerHTML = '<div class="loading">Failed to load question. Try again later.</div>';
+  }
+}
+
+function renderQuestion() {
+  const card = document.getElementById('questionCard');
+  if (!todayData) { card.innerHTML = '<div class="loading">No question today yet.</div>'; return; }
+
+  if (hasSubmittedToday()) {
+    card.innerHTML = `
+      <div class="submitted-banner">
+        <div class="big">✅</div>
+        <h3>Answer Submitted!</h3>
+        <p>Come back tomorrow for a new question.<br>Check "Yesterday's Answer" to see today's solution tomorrow!</p>
+      </div>`;
+    return;
+  }
+
+  card.innerHTML = `
+    <div class="card-title">Today's Question</div>
+    <div class="level-badge">${todayData.level}</div>
+    <div class="question-text">${todayData.question}</div>
+    <div class="options" id="optionsContainer">
+      ${['A','B','C','D','E'].map(l => `
+        <div class="option" id="opt-${l}" onclick="selectAnswer('${l}')">
+          <div class="option-letter">${l}</div>
+          <div>${todayData['option_' + l.toLowerCase()]}</div>
+        </div>`).join('')}
+    </div>
+    <div class="input-group">
+      <div class="input-label">Minecraft Username</div>
+      <input class="input-field" id="mcInput" placeholder="Your MC username..." maxlength="16">
+    </div>
+    <div class="input-group">
+      <div class="input-label">Discord Username</div>
+      <input class="input-field" id="discordInput" placeholder="e.g. yourname or yourname#1234" maxlength="32">
+    </div>
+    <button class="submit-btn" id="submitBtn" onclick="submitAnswer()">Submit Answer</button>
+    <div id="submitStatus" style="text-align:center;margin-top:10px;font-size:13px;"></div>
+  `;
+}
+
+function selectAnswer(letter) {
+  selectedAnswer = letter;
+  document.querySelectorAll('.option').forEach(el => el.classList.remove('selected'));
+  document.getElementById(`opt-${letter}`).classList.add('selected');
+}
+
+async function submitAnswer() {
+  const mc = document.getElementById('mcInput')?.value.trim();
+  const discord = document.getElementById('discordInput')?.value.trim();
+  const status = document.getElementById('submitStatus');
+  const btn = document.getElementById('submitBtn');
+
+  if (!selectedAnswer) { status.textContent = '⚠️ Please select an answer!'; return; }
+  if (!mc) { status.textContent = '⚠️ Please enter your Minecraft username!'; return; }
+  if (!discord) { status.textContent = '⚠️ Please enter your Discord username!'; return; }
+
+  btn.disabled = true;
+  btn.textContent = 'Submitting...';
+
+  try {
+    const res = await fetch('/submit', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({mc_username: mc, discord_username: discord, answer: selectedAnswer})
+    });
+    const data = await res.json();
+
+    if (data.success) {
+      localStorage.setItem(`submitted-${today}`, '1');
+      renderQuestion();
+    } else {
+      status.textContent = `❌ ${data.error}`;
+      btn.disabled = false;
+      btn.textContent = 'Submit Answer';
+    }
+  } catch {
+    status.textContent = '❌ Failed to submit. Try again.';
+    btn.disabled = false;
+    btn.textContent = 'Submit Answer';
+  }
+}
+
+function renderYesterday() {
+  const card = document.getElementById('yesterdayCard');
+  if (!yesterdayData) {
+    card.innerHTML = '<div class="loading">No previous question yet — come back tomorrow!</div>';
+    return;
+  }
+  card.innerHTML = `
+    <div class="card-title">Yesterday's Question</div>
+    <div class="level-badge">${yesterdayData.level}</div>
+    <div class="question-text" style="margin-bottom:16px;">${yesterdayData.question}</div>
+    <div class="card-title">Answer</div>
+    <div class="yesterday-answer">Option ${yesterdayData.answer}</div>
+    <div class="card-title" style="margin-top:14px;">Explanation</div>
+    <div class="explanation">${yesterdayData.explanation}</div>
+  `;
+}
+
+async function loadLeaderboard() {
+  const list = document.getElementById('leaderboardList');
+  list.innerHTML = '<div class="loading">Loading...</div>';
+  try {
+    const res = await fetch('/leaderboard');
+    const users = await res.json();
+    if (users.length === 0) { list.innerHTML = '<div class="loading">No submissions yet!</div>'; return; }
+    const medals = ['🥇','🥈','🥉'];
+    list.innerHTML = users.map((u, i) => `
+      <div class="leaderboard-row">
+        <div class="lb-rank">${medals[i] || (i+1)}</div>
+        <div class="lb-name">${u.mc_username}</div>
+        <div class="lb-score"><span class="lb-correct">${u.correct}</span> / ${u.total} correct</div>
+      </div>`).join('');
+  } catch {
+    list.innerHTML = '<div class="loading">Failed to load.</div>';
+  }
+}
+
+loadQuestion();
+
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('/sw.js');
+}
+</script>
+</body>
+</html>
