@@ -82,14 +82,7 @@ def init_db():
         ip              TEXT PRIMARY KEY,
         last_submitted  INTEGER DEFAULT 0
     )''')
-    conn.execute('''CREATE TABLE IF NOT EXISTS pending_rewards (
-        mc_username  TEXT PRIMARY KEY,
-        streak       INTEGER,
-        item         TEXT,
-        amount       INTEGER,
-        label        TEXT,
-        earned_date  TEXT
-    )''')
+    
     conn.commit()
     conn.close()
 
@@ -1864,8 +1857,6 @@ def deliver_pending_rewards(mc_username):
         give_cmd = f"give {mc_username} minecraft:{row['item']} {row['amount']}"
         earned = row['earned_date']
         label = row['label']
-        earned = row['earned_date']
-        label = row['label']
         msg_cmd  = (
             f'tellraw {mc_username} [{{"text":"[UKMT] ","color":"gold","bold":true}},'
             f'{{"text":"Pending reward from {earned}: {label}","color":"yellow"}}]'
@@ -1897,9 +1888,10 @@ def give_streak_reward(mc_username, streak):
         return
 
     give_cmd = f"give {mc_username} minecraft:{reward['item']} {reward['amount']}"
+    reward_label = reward['label']
     msg_cmd  = (
         f'tellraw {mc_username} [{{"text":"[UKMT] ","color":"gold","bold":true}},'
-        f'{{"text":"Day {streak} streak! You earned: {reward[\"label\"]}","color":"yellow"}}]'
+        f'{{"text":"Day {streak} streak! You earned: {reward_label}","color":"yellow"}}]'
     )
     run_rcon(give_cmd)
     run_rcon(msg_cmd)
