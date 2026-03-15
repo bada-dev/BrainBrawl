@@ -53,6 +53,17 @@ def init_db():
         conn.execute('CREATE INDEX IF NOT EXISTS idx_question_hash ON questions(question_hash)')
     except Exception:
         pass
+    try:
+        conn.execute('''CREATE TABLE IF NOT EXISTS pending_rewards (
+            mc_username  TEXT PRIMARY KEY,
+            streak       INTEGER,
+            item         TEXT,
+            amount       INTEGER,
+            label        TEXT,
+            earned_date  TEXT
+        )''')
+    except Exception:
+        pass
 conn.execute('''CREATE TABLE IF NOT EXISTS submissions (
         id              INTEGER PRIMARY KEY AUTOINCREMENT,
         date            TEXT,
@@ -70,6 +81,14 @@ conn.execute('''CREATE TABLE IF NOT EXISTS submissions (
     conn.execute('''CREATE TABLE IF NOT EXISTS feedback_cooldowns (
         ip              TEXT PRIMARY KEY,
         last_submitted  INTEGER DEFAULT 0
+    )''')
+    conn.execute('''CREATE TABLE IF NOT EXISTS pending_rewards (
+        mc_username  TEXT PRIMARY KEY,
+        streak       INTEGER,
+        item         TEXT,
+        amount       INTEGER,
+        label        TEXT,
+        earned_date  TEXT
     )''')
     conn.commit()
     conn.close()
@@ -1808,20 +1827,77 @@ def update_player_streak(mc_username, correct, today):
     return new_streak
 
 
+def is_player_online(mc_username):
+    """Check if a player is currently online via RCON."""
+    response = run_rcon("list")
+    if response is None:
+        return False
+    # "list" returns e.g. "There are 3 of a max of 20 players online: Steve, Alex, Notch"
+    return mc_username.lower() in response.lower()
+
+
+def store_pending_reward(mc_username, streak, reward):
+    """Queue a reward for offline delivery."""
+    conn = get_db()
+    conn.execute(
+        '''INSERT OR REPLACE INTO pending_rewards
+           (mc_username, streak, item, amount, label, earned_date)
+           VALUES (?, ?, ?, ?, ?, ?)''',
+        (mc_username, streak, reward['item'], reward['amount'],
+         reward['label'], date.today().isoformat())
+    )
+    conn.commit()
+    conn.close()
+    print(f"⏳ Reward queued for offline player {mc_username}: {reward['label']}")
+
+
+def deliver_pending_rewards(mc_username):
+    """Deliver any queued rewards for a player who is now online."""
+    conn = get_db()
+    rows = conn.execute(
+        'SELECT * FROM pending_rewards WHERE mc_username = ?',
+        (mc_username,)
+    ).fetchall()
+    conn.close()
+
+    for row in rows:
+        give_cmd = f"give {mc_username} minecraft:{row['item']} {row['amount']}"
+        msg_cmd  = (
+            f'tellraw {mc_username} [{{"text":"[UKMT] ","color":"gold","bold":true}},'
+            f'{{"text":"Pending reward from {row[\"earned_date\"]}: '
+            f'{row[\"label\"]}","color":"yellow"}}]'
+        )
+        run_rcon(give_cmd)
+        run_rcon(msg_cmd)
+        print(f"✅ Delivered pending reward to {mc_username}: {row['label']}")
+
+    if rows:
+        conn = get_db()
+        conn.execute(
+            'DELETE FROM pending_rewards WHERE mc_username = ?', (mc_username,)
+        )
+        conn.commit()
+        conn.close()
+
+
 def give_streak_reward(mc_username, streak):
     """
     Give the reward for this streak day via RCON.
-    Streak 1-7, then stays at day 7 reward forever.
+    If player is offline, queues the reward for delivery next time they're online.
     """
-    idx = min(streak, 7) - 1          # clamp to 0-6
+    idx    = min(streak, 7) - 1
     reward = STREAK_REWARDS[idx]
+
+    if not is_player_online(mc_username):
+        store_pending_reward(mc_username, streak, reward)
+        print(f"⚠️ {mc_username} is offline — reward queued")
+        return
 
     give_cmd = f"give {mc_username} minecraft:{reward['item']} {reward['amount']}"
     msg_cmd  = (
         f'tellraw {mc_username} [{{"text":"[UKMT] ","color":"gold","bold":true}},'
         f'{{"text":"Day {streak} streak! You earned: {reward[\"label\"]}","color":"yellow"}}]'
     )
-
     run_rcon(give_cmd)
     run_rcon(msg_cmd)
     print(f"✅ RCON: gave {mc_username} {reward['label']} (streak day {streak})")
@@ -1870,6 +1946,19 @@ def send_discord(mc_username, discord_username, answer, is_correct, question_tex
 
 scheduler = BackgroundScheduler()
 scheduler.add_job(generate_question, 'cron', hour=0, minute=1)
+def check_and_deliver_pending():
+    """Every 5 minutes, check if any offline-rewarded players are now online."""
+    conn = get_db()
+    pending = conn.execute(
+        'SELECT DISTINCT mc_username FROM pending_rewards'
+    ).fetchall()
+    conn.close()
+    for row in pending:
+        username = row['mc_username']
+        if is_player_online(username):
+            deliver_pending_rewards(username)
+
+scheduler.add_job(check_and_deliver_pending, 'interval', minutes=5)
 scheduler.start()
 
 
@@ -1992,6 +2081,17 @@ def submit():
         'streak':       new_streak,
         'reward':       reward_label,
     })
+
+@app.route('/claim/<mc_username>')
+def claim_reward(mc_username):
+    """Player visits this to manually claim any pending reward."""
+    if not is_player_online(mc_username):
+        return jsonify({
+            'success': False,
+            'message': f'{mc_username} must be online in-game to claim rewards.'
+        })
+    deliver_pending_rewards(mc_username)
+    return jsonify({'success': True, 'message': 'Rewards delivered!'})
 
 @app.route('/streak/<mc_username>')
 def get_streak(mc_username):
