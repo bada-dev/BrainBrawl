@@ -5,6 +5,7 @@ import time
 import random
 import math
 import ast
+import hashlib
 from datetime import datetime, date, timedelta
 from fractions import Fraction
 from flask import Flask, render_template, request, jsonify, send_from_directory
@@ -13,7 +14,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 
 app = Flask(__name__)
 
-GROQ_API_KEY = os.environ.get('GROQ_API_KEY')
+GROQ_API_KEY  = os.environ.get('GROQ_API_KEY')
 DISCORD_WEBHOOK = os.environ.get('DISCORD_WEBHOOK')
 client = Groq(api_key=GROQ_API_KEY)
 
@@ -29,31 +30,41 @@ def get_db():
 def init_db():
     conn = get_db()
     conn.execute('''CREATE TABLE IF NOT EXISTS questions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        date TEXT UNIQUE,
-        question TEXT,
-        option_a TEXT,
-        option_b TEXT,
-        option_c TEXT,
-        option_d TEXT,
-        option_e TEXT,
-        answer TEXT,
-        explanation TEXT,
-        level TEXT,
-        source TEXT DEFAULT 'template'
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        date            TEXT UNIQUE,
+        question        TEXT,
+        question_hash   TEXT,
+        option_a        TEXT,
+        option_b        TEXT,
+        option_c        TEXT,
+        option_d        TEXT,
+        option_e        TEXT,
+        answer          TEXT,
+        explanation     TEXT,
+        level           TEXT,
+        source          TEXT DEFAULT "template"
     )''')
+    # Add question_hash column to existing DBs that were created without it
+    try:
+        conn.execute('ALTER TABLE questions ADD COLUMN question_hash TEXT')
+    except Exception:
+        pass  # column already exists
+    try:
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_question_hash ON questions(question_hash)')
+    except Exception:
+        pass
     conn.execute('''CREATE TABLE IF NOT EXISTS submissions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        date TEXT,
-        mc_username TEXT,
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        date            TEXT,
+        mc_username     TEXT,
         discord_username TEXT,
-        answer TEXT,
-        is_correct INTEGER,
-        submitted_at INTEGER
+        answer          TEXT,
+        is_correct      INTEGER,
+        submitted_at    INTEGER
     )''')
     conn.execute('''CREATE TABLE IF NOT EXISTS feedback_cooldowns (
-        ip TEXT PRIMARY KEY,
-        last_submitted INTEGER DEFAULT 0
+        ip              TEXT PRIMARY KEY,
+        last_submitted  INTEGER DEFAULT 0
     )''')
     conn.commit()
     conn.close()
@@ -62,594 +73,968 @@ init_db()
 
 FEEDBACK_COOLDOWN = 48 * 60 * 60
 
+
+def q_hash(question_text):
+    """Stable hash for deduplication."""
+    normalised = question_text.lower().strip()
+    return hashlib.md5(normalised.encode()).hexdigest()
+
+
+def hash_exists(h):
+    """Return True if this question hash is already in the DB."""
+    conn = get_db()
+    row = conn.execute(
+        'SELECT id FROM questions WHERE question_hash = ?', (h,)
+    ).fetchone()
+    conn.close()
+    return row is not None
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# TEMPLATE QUESTION SYSTEM
-# Every question here is structurally correct — Python computes the answer.
-# The AI never touches the math, only optionally rewrites the wording.
+# OPTION GENERATION HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
-PYTHAGOREAN_TRIPLES = [
-    (3, 4, 5), (5, 12, 13), (8, 15, 17), (7, 24, 25),
-    (9, 40, 41), (20, 21, 29), (9, 12, 15), (12, 16, 20),
-    (15, 20, 25), (6, 8, 10)
-]
-
-
-def make_numeric_options(correct):
+def make_numeric_options(correct, positive_only=True):
     """
-    Generate 4 plausible wrong answers for a numeric correct answer.
-    Returns (list_of_5_strings, answer_letter).
-    All wrong answers are positive and different from correct.
+    Generate 4 plausible wrong answers, return (list_of_5_strings, answer_letter).
+    Deltas are scaled to the magnitude of the answer so distractors are believable.
     """
-    correct_int = int(correct) if float(correct) == int(correct) else correct
+    cv = int(correct) if isinstance(correct, float) and correct == int(correct) else correct
+    mag = max(abs(cv), 1)
+
+    if mag <= 12:
+        pool = [-6,-5,-4,-3,-2,-1,1,2,3,4,5,6,7,8,-7,-8]
+    elif mag <= 60:
+        pool = [-20,-15,-12,-10,-8,-6,-5,-4,-3,-2,2,3,4,5,6,8,10,12,15,20]
+    elif mag <= 300:
+        pool = [-60,-50,-40,-30,-20,-15,-10,-5,5,10,15,20,30,40,50,60,80,100]
+    elif mag <= 1000:
+        pool = [-200,-150,-100,-80,-50,-30,30,50,80,100,150,200,300,-300]
+    else:
+        pool = [-500,-300,-200,-100,100,200,300,500,800,-800]
+
+    random.shuffle(pool)
     wrongs = set()
-    attempts = 0
-    deltas = [-30, -20, -15, -12, -10, -8, -6, -5, -4, -3, -2, -1,
-               1,   2,   3,   4,   5,   6,   8,  10,  12,  15,  20, 30]
-    random.shuffle(deltas)
-    for d in deltas:
+    for d in pool:
         if len(wrongs) >= 4:
             break
-        w = correct_int + d
-        if w > 0 and w != correct_int:
+        w = cv + d
+        if w != cv and (not positive_only or w > 0):
             wrongs.add(w)
-    # fallback if not enough
-    extra = 1
-    while len(wrongs) < 4:
-        w = correct_int + extra * 7
-        if w != correct_int:
-            wrongs.add(w)
-        extra += 1
 
-    all_opts = [correct_int] + list(wrongs)[:4]
+    # Safety fallback
+    step = max(mag // 4, 1)
+    attempts = 1
+    while len(wrongs) < 4:
+        for sign in (1, -1):
+            w = cv + sign * step * attempts
+            if w != cv and (not positive_only or w > 0):
+                wrongs.add(w)
+            if len(wrongs) >= 4:
+                break
+        attempts += 1
+
+    all_opts = [cv] + list(wrongs)[:4]
     random.shuffle(all_opts)
-    answer_letter = 'ABCDE'[all_opts.index(correct_int)]
-    formatted = [str(x) for x in all_opts]
-    return formatted, answer_letter
+    answer_letter = 'ABCDE'[all_opts.index(cv)]
+    return [str(x) for x in all_opts], answer_letter
 
 
 def make_pi_options(correct_base):
-    """For answers expressed as Nπ — correct_base is the integer N."""
-    wrongs = set()
-    for d in [-4, -3, -2, -1, 1, 2, 3, 4, 6, 8]:
-        if len(wrongs) >= 4:
-            break
-        w = correct_base + d
-        if w > 0:
-            wrongs.add(w)
-    all_opts = [correct_base] + list(wrongs)[:4]
+    """For answers expressed as N·π — correct_base is the integer coefficient."""
+    cb = int(correct_base)
+    if cb <= 6:
+        pool = [1,2,3,4,5,6,8,9,10,12]
+    elif cb <= 30:
+        pool = [cb-8, cb-6, cb-4, cb-2, cb+2, cb+4, cb+6, cb+8, cb+10, cb+12]
+    else:
+        pool = [cb-20, cb-12, cb-8, cb-4, cb+4, cb+8, cb+12, cb+20, cb+24]
+
+    pool = list({abs(x) for x in pool if x > 0 and x != cb})
+    random.shuffle(pool)
+    all_opts = [cb] + pool[:4]
+    while len(all_opts) < 5:
+        all_opts.append(all_opts[-1] + 4)
     random.shuffle(all_opts)
-    answer_letter = 'ABCDE'[all_opts.index(correct_base)]
-    formatted = [f"{x}π" for x in all_opts]
-    return formatted, answer_letter
+    letter = 'ABCDE'[all_opts.index(cb)]
+    return [f"{x}π" for x in all_opts], letter
 
 
 def make_fraction_options(num, den):
-    """For probability/fraction answers."""
+    """Generate 5 fraction options, one correct."""
     from math import gcd
-    g = gcd(num, den)
-    correct = (num // g, den // g)
-    correct_str = f"{correct[0]}/{correct[1]}"
-    wrongs = []
+    g = gcd(abs(num), abs(den))
+    correct_str = f"{num // g}/{den // g}"
     seen = {correct_str}
-    for wn in range(1, den):
+    wrongs = []
+    # vary numerator keeping same denominator
+    for delta in range(1, den + 5):
         if len(wrongs) >= 4:
             break
-        wg = gcd(wn, den)
-        ws = f"{wn//wg}/{den//wg}"
-        if ws not in seen:
-            seen.add(ws)
-            wrongs.append(ws)
-    if len(wrongs) < 4:
-        for extra_den in [den+1, den+2, den-1]:
+        for wn in (num + delta, num - delta):
             if len(wrongs) >= 4:
                 break
-            if extra_den > 1:
-                ws = f"1/{extra_den}"
+            if wn > 0:
+                wg = gcd(wn, den)
+                ws = f"{wn // wg}/{den // wg}"
                 if ws not in seen:
                     seen.add(ws)
                     wrongs.append(ws)
+    while len(wrongs) < 4:
+        wrongs.append(f"{len(wrongs)+2}/{den+1}")
     all_opts = [correct_str] + wrongs[:4]
-    while len(all_opts) < 5:
-        all_opts.append(f"{len(all_opts)}/{den+1}")
     random.shuffle(all_opts)
-    answer_letter = 'ABCDE'[all_opts.index(correct_str)]
-    return all_opts, answer_letter
+    letter = 'ABCDE'[all_opts.index(correct_str)]
+    return all_opts, letter
 
 
-# ── TEMPLATE DEFINITIONS ─────────────────────────────────────────────────────
-# Each entry is a function that returns a complete question dict.
-# Python computes ANSWER — never the AI.
+# ─────────────────────────────────────────────────────────────────────────────
+# PYTHAGOREAN TRIPLES
+# ─────────────────────────────────────────────────────────────────────────────
+
+PYTHAGOREAN_TRIPLES = [
+    (3,4,5),(5,12,13),(8,15,17),(7,24,25),
+    (9,40,41),(20,21,29),(9,12,15),(12,16,20),
+    (15,20,25),(6,8,10),(10,24,26),(18,24,30),
+]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ██████████████████████  QUESTION TEMPLATES  ████████████████████████████████
+# Every answer is computed by Python. Assertions are guards — if one fails the
+# template is silently skipped and another is tried.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+# ── GEOMETRY ─────────────────────────────────────────────────────────────────
 
 def tpl_rectangle_area():
     a, b, _ = random.choice(PYTHAGOREAN_TRIPLES)
-    scale = random.randint(1, 4)
-    w, h = a * scale, b * scale
-    answer = w * h
-    assert w * h == answer
-    opts, letter = make_numeric_options(answer)
+    s = random.randint(1, 5)
+    w, h = a * s, b * s
+    ans = w * h
+    assert w * h == ans
+    opts, let = make_numeric_options(ans)
     return {
         "question": f"A rectangle has length {w} cm and width {h} cm. What is its area?",
-        "option_a": opts[0] + " cm²", "option_b": opts[1] + " cm²",
-        "option_c": opts[2] + " cm²", "option_d": opts[3] + " cm²",
-        "option_e": opts[4] + " cm²",
-        "answer": letter,
-        "explanation": f"Area = length × width = {w} × {h} = {answer} cm².",
+        "option_a": opts[0]+" cm²","option_b": opts[1]+" cm²",
+        "option_c": opts[2]+" cm²","option_d": opts[3]+" cm²","option_e": opts[4]+" cm²",
+        "answer": let,
+        "explanation": f"Area = length × width = {w} × {h} = {ans} cm².",
         "level": "Junior (JMC)"
     }
 
+
+def tpl_triangle_area_bh():
+    b = random.choice([4,6,8,10,12,14,16,18,20])   # even → integer area
+    h = random.randint(3, 15)
+    ans = b * h // 2
+    assert b * h % 2 == 0 and b * h // 2 == ans
+    opts, let = make_numeric_options(ans)
+    return {
+        "question": f"A triangle has base {b} cm and perpendicular height {h} cm. What is its area?",
+        "option_a": opts[0]+" cm²","option_b": opts[1]+" cm²",
+        "option_c": opts[2]+" cm²","option_d": opts[3]+" cm²","option_e": opts[4]+" cm²",
+        "answer": let,
+        "explanation": f"Area = ½ × base × height = ½ × {b} × {h} = {ans} cm².",
+        "level": "Junior (JMC)"
+    }
+
+
+def tpl_trapezoid_area():
+    h = random.randint(2, 10)
+    a = random.randint(3, 14)
+    b = random.randint(3, 14)
+    while b == a:
+        b = random.randint(3, 14)
+    if (a + b) % 2 != 0:
+        b += 1          # make sum even → integer area
+    ans = (a + b) // 2 * h
+    assert (a + b) % 2 == 0 and (a + b) // 2 * h == ans
+    opts, let = make_numeric_options(ans)
+    return {
+        "question": (f"A trapezoid has parallel sides of length {a} cm and {b} cm, "
+                     f"and a perpendicular height of {h} cm. What is its area?"),
+        "option_a": opts[0]+" cm²","option_b": opts[1]+" cm²",
+        "option_c": opts[2]+" cm²","option_d": opts[3]+" cm²","option_e": opts[4]+" cm²",
+        "answer": let,
+        "explanation": (f"Area of a trapezoid = ½(a+b)×h = ½×({a}+{b})×{h} "
+                        f"= ½×{a+b}×{h} = {ans} cm²."),
+        "level": "Intermediate (IMC)"
+    }
+
+
 def tpl_circle_area():
     r = random.randint(2, 12)
-    base = r * r  # answer is base·π — integer, no floating point
-    # No float assertion needed: base = r*r is exact integer arithmetic
-    opts, letter = make_pi_options(base)
+    base = r * r          # integer coefficient of π
+    opts, let = make_pi_options(base)
     return {
-        "question": f"A circle has radius {r} cm. What is its area? Give your answer in terms of π.",
-        "option_a": opts[0], "option_b": opts[1],
-        "option_c": opts[2], "option_d": opts[3], "option_e": opts[4],
-        "answer": letter,
+        "question": f"A circle has radius {r} cm. What is its area? (Give your answer in terms of π.)",
+        "option_a": opts[0],"option_b": opts[1],"option_c": opts[2],
+        "option_d": opts[3],"option_e": opts[4],
+        "answer": let,
         "explanation": f"Area = πr² = π × {r}² = {base}π cm².",
         "level": "Junior (JMC)"
     }
 
+
 def tpl_circle_circumference():
     r = random.randint(2, 15)
-    base = 2 * r  # answer is base·π
-    opts, letter = make_pi_options(base)
+    base = 2 * r
+    opts, let = make_pi_options(base)
     return {
-        "question": f"A circle has radius {r} cm. What is its circumference? Give your answer in terms of π.",
-        "option_a": opts[0], "option_b": opts[1],
-        "option_c": opts[2], "option_d": opts[3], "option_e": opts[4],
-        "answer": letter,
+        "question": f"A circle has radius {r} cm. What is its circumference? (Give your answer in terms of π.)",
+        "option_a": opts[0],"option_b": opts[1],"option_c": opts[2],
+        "option_d": opts[3],"option_e": opts[4],
+        "answer": let,
         "explanation": f"Circumference = 2πr = 2 × π × {r} = {base}π cm.",
         "level": "Junior (JMC)"
     }
 
+
 def tpl_cube_surface_area():
     s = random.randint(2, 10)
-    answer = 6 * s * s
-    assert 6 * s**2 == answer
-    opts, letter = make_numeric_options(answer)
+    ans = 6 * s * s
+    assert 6 * s**2 == ans
+    opts, let = make_numeric_options(ans)
     return {
         "question": f"A cube has side length {s} cm. What is its total surface area?",
-        "option_a": opts[0] + " cm²", "option_b": opts[1] + " cm²",
-        "option_c": opts[2] + " cm²", "option_d": opts[3] + " cm²",
-        "option_e": opts[4] + " cm²",
-        "answer": letter,
-        "explanation": f"A cube has 6 square faces. Surface area = 6 × s² = 6 × {s}² = 6 × {s**2} = {answer} cm².",
+        "option_a": opts[0]+" cm²","option_b": opts[1]+" cm²",
+        "option_c": opts[2]+" cm²","option_d": opts[3]+" cm²","option_e": opts[4]+" cm²",
+        "answer": let,
+        "explanation": f"Surface area = 6s² = 6 × {s}² = 6 × {s**2} = {ans} cm².",
         "level": "Junior (JMC)"
     }
 
+
 def tpl_cube_volume():
     s = random.randint(2, 10)
-    answer = s ** 3
-    assert s**3 == answer
-    opts, letter = make_numeric_options(answer)
+    ans = s ** 3
+    assert s**3 == ans
+    opts, let = make_numeric_options(ans)
     return {
         "question": f"A cube has side length {s} cm. What is its volume?",
-        "option_a": opts[0] + " cm³", "option_b": opts[1] + " cm³",
-        "option_c": opts[2] + " cm³", "option_d": opts[3] + " cm³",
-        "option_e": opts[4] + " cm³",
-        "answer": letter,
-        "explanation": f"Volume = s³ = {s}³ = {answer} cm³.",
+        "option_a": opts[0]+" cm³","option_b": opts[1]+" cm³",
+        "option_c": opts[2]+" cm³","option_d": opts[3]+" cm³","option_e": opts[4]+" cm³",
+        "answer": let,
+        "explanation": f"Volume = s³ = {s}³ = {ans} cm³.",
         "level": "Junior (JMC)"
     }
+
 
 def tpl_cylinder_volume():
     r = random.randint(2, 7)
     h = random.randint(3, 12)
-    base = r * r * h  # answer is base·π
+    base = r * r * h
     assert r**2 * h == base
-    opts, letter = make_pi_options(base)
+    opts, let = make_pi_options(base)
     return {
-        "question": f"A cylinder has radius {r} cm and height {h} cm. What is its volume? Give your answer in terms of π.",
-        "option_a": opts[0], "option_b": opts[1],
-        "option_c": opts[2], "option_d": opts[3], "option_e": opts[4],
-        "answer": letter,
-        "explanation": f"Volume = πr²h = π × {r}² × {h} = π × {r**2} × {h} = {base}π cm³.",
+        "question": (f"A cylinder has radius {r} cm and height {h} cm. "
+                     f"What is its volume? (Give your answer in terms of π.)"),
+        "option_a": opts[0],"option_b": opts[1],"option_c": opts[2],
+        "option_d": opts[3],"option_e": opts[4],
+        "answer": let,
+        "explanation": f"Volume = πr²h = π × {r}² × {h} = {base}π cm³.",
         "level": "Intermediate (IMC)"
     }
 
+
+def tpl_sphere_surface_area():
+    r = random.randint(2, 8)
+    base = 4 * r * r      # integer coefficient of π
+    opts, let = make_pi_options(base)
+    return {
+        "question": (f"A sphere has radius {r} cm. What is its surface area? "
+                     f"(Give your answer in terms of π.)"),
+        "option_a": opts[0],"option_b": opts[1],"option_c": opts[2],
+        "option_d": opts[3],"option_e": opts[4],
+        "answer": let,
+        "explanation": f"Surface area = 4πr² = 4 × π × {r}² = 4 × {r**2}π = {base}π cm².",
+        "level": "Intermediate (IMC)"
+    }
+
+
 def tpl_right_triangle_hypotenuse():
     a, b, c = random.choice(PYTHAGOREAN_TRIPLES)
-    scale = random.randint(1, 3)
-    sa, sb, sc = a*scale, b*scale, c*scale
+    s = random.randint(1, 3)
+    sa, sb, sc = a*s, b*s, c*s
     assert sa**2 + sb**2 == sc**2
-    opts, letter = make_numeric_options(sc)
+    opts, let = make_numeric_options(sc)
     return {
-        "question": f"A right-angled triangle has legs {sa} cm and {sb} cm. What is the length of the hypotenuse?",
-        "option_a": opts[0] + " cm", "option_b": opts[1] + " cm",
-        "option_c": opts[2] + " cm", "option_d": opts[3] + " cm",
-        "option_e": opts[4] + " cm",
-        "answer": letter,
-        "explanation": f"By Pythagoras: hypotenuse = √({sa}² + {sb}²) = √({sa**2} + {sb**2}) = √{sc**2} = {sc} cm.",
+        "question": f"A right-angled triangle has legs {sa} cm and {sb} cm. What is the hypotenuse?",
+        "option_a": opts[0]+" cm","option_b": opts[1]+" cm",
+        "option_c": opts[2]+" cm","option_d": opts[3]+" cm","option_e": opts[4]+" cm",
+        "answer": let,
+        "explanation": (f"Hypotenuse = √({sa}² + {sb}²) = √({sa**2} + {sb**2}) "
+                        f"= √{sc**2} = {sc} cm."),
         "level": "Junior (JMC)"
     }
 
+
 def tpl_right_triangle_leg():
     a, b, c = random.choice(PYTHAGOREAN_TRIPLES)
-    scale = random.randint(1, 3)
-    sa, sb, sc = a*scale, b*scale, c*scale
+    s = random.randint(1, 3)
+    sa, sb, sc = a*s, b*s, c*s
     assert sa**2 + sb**2 == sc**2
-    opts, letter = make_numeric_options(sb)
+    opts, let = make_numeric_options(sb)
     return {
-        "question": f"A right-angled triangle has hypotenuse {sc} cm and one leg {sa} cm. What is the other leg?",
-        "option_a": opts[0] + " cm", "option_b": opts[1] + " cm",
-        "option_c": opts[2] + " cm", "option_d": opts[3] + " cm",
-        "option_e": opts[4] + " cm",
-        "answer": letter,
-        "explanation": f"Other leg = √({sc}² − {sa}²) = √({sc**2} − {sa**2}) = √{sb**2} = {sb} cm.",
+        "question": (f"A right-angled triangle has hypotenuse {sc} cm "
+                     f"and one leg {sa} cm. What is the length of the other leg?"),
+        "option_a": opts[0]+" cm","option_b": opts[1]+" cm",
+        "option_c": opts[2]+" cm","option_d": opts[3]+" cm","option_e": opts[4]+" cm",
+        "answer": let,
+        "explanation": (f"Leg = √({sc}² − {sa}²) = √({sc**2} − {sa**2}) "
+                        f"= √{sb**2} = {sb} cm."),
         "level": "Junior (JMC)"
     }
+
 
 def tpl_interior_angle_polygon():
     n = random.choice([5, 6, 8, 9, 10, 12])
     total = (n - 2) * 180
+    assert total % n == 0
     angle = total // n
-    assert (n - 2) * 180 % n == 0  # must be whole number
-    assert (n - 2) * 180 // n == angle
-    opts, letter = make_numeric_options(angle)
+    opts, let = make_numeric_options(angle)
     return {
         "question": f"What is the size of each interior angle of a regular {n}-sided polygon?",
-        "option_a": opts[0] + "°", "option_b": opts[1] + "°",
-        "option_c": opts[2] + "°", "option_d": opts[3] + "°",
-        "option_e": opts[4] + "°",
-        "answer": letter,
-        "explanation": f"Sum of interior angles = (n−2)×180° = ({n}−2)×180° = {total}°. Each angle = {total}° ÷ {n} = {angle}°.",
+        "option_a": opts[0]+"°","option_b": opts[1]+"°",
+        "option_c": opts[2]+"°","option_d": opts[3]+"°","option_e": opts[4]+"°",
+        "answer": let,
+        "explanation": (f"Sum of interior angles = (n−2)×180° = {n-2}×180° = {total}°. "
+                        f"Each angle = {total}° ÷ {n} = {angle}°."),
         "level": "Intermediate (IMC)"
     }
+
 
 def tpl_exterior_angle_polygon():
     ext = random.choice([30, 36, 40, 45, 60, 72])
     n = 360 // ext
-    assert 360 % ext == 0
-    assert 360 // ext == n
-    opts, letter = make_numeric_options(n)
+    assert 360 % ext == 0 and 360 // ext == n
+    opts, let = make_numeric_options(n)
     return {
-        "question": f"Each exterior angle of a regular polygon is {ext}°. How many sides does the polygon have?",
-        "option_a": opts[0], "option_b": opts[1],
-        "option_c": opts[2], "option_d": opts[3], "option_e": opts[4],
-        "answer": letter,
-        "explanation": f"Number of sides = 360° ÷ exterior angle = 360° ÷ {ext}° = {n}.",
+        "question": (f"Each exterior angle of a regular polygon measures {ext}°. "
+                     f"How many sides does the polygon have?"),
+        "option_a": opts[0],"option_b": opts[1],"option_c": opts[2],
+        "option_d": opts[3],"option_e": opts[4],
+        "answer": let,
+        "explanation": f"Number of sides = 360° ÷ {ext}° = {n}.",
         "level": "Intermediate (IMC)"
     }
+
 
 def tpl_triangle_missing_angle():
     a = random.randint(30, 80)
     b = random.randint(30, 80)
     c = 180 - a - b
-    if c <= 0 or c >= 180:
-        a, b, c = 50, 70, 60
-    assert a + b + c == 180
-    opts, letter = make_numeric_options(c)
+    assert c > 0 and a + b + c == 180
+    opts, let = make_numeric_options(c)
     return {
         "question": f"Two angles of a triangle are {a}° and {b}°. What is the third angle?",
-        "option_a": opts[0] + "°", "option_b": opts[1] + "°",
-        "option_c": opts[2] + "°", "option_d": opts[3] + "°",
-        "option_e": opts[4] + "°",
-        "answer": letter,
-        "explanation": f"Angles in a triangle sum to 180°. Third angle = 180° − {a}° − {b}° = {c}°.",
+        "option_a": opts[0]+"°","option_b": opts[1]+"°",
+        "option_c": opts[2]+"°","option_d": opts[3]+"°","option_e": opts[4]+"°",
+        "answer": let,
+        "explanation": f"Angles sum to 180°: third angle = 180° − {a}° − {b}° = {c}°.",
         "level": "Junior (JMC)"
     }
 
-def tpl_isosceles_triangle_angle():
-    base = random.choice([30, 40, 50, 60, 70, 80, 100, 110, 120])
-    equal = (180 - base) // 2
-    if (180 - base) % 2 != 0:
-        base = 40
-        equal = 70
-    assert base + 2 * equal == 180
-    opts, letter = make_numeric_options(equal)
-    return {
-        "question": f"An isosceles triangle has a base angle of {base}°. Wait — actually the apex angle is {base}°. What are the base angles?",
-        "option_a": opts[0] + "°", "option_b": opts[1] + "°",
-        "option_c": opts[2] + "°", "option_d": opts[3] + "°",
-        "option_e": opts[4] + "°",
-        "answer": letter,
-        "explanation": f"Base angles are equal. Base angle = (180° − {base}°) ÷ 2 = {180 - base}° ÷ 2 = {equal}°.",
-        "level": "Junior (JMC)"
-    }
 
 def tpl_quadrilateral_missing_angle():
-    a = random.randint(60, 100)
-    b = random.randint(60, 100)
-    c = random.randint(60, 100)
+    a = random.randint(60, 110)
+    b = random.randint(60, 110)
+    c = random.randint(60, 110)
     d = 360 - a - b - c
-    if d <= 0 or d >= 360:
-        a, b, c, d = 80, 90, 110, 80
-    assert a + b + c + d == 360
-    opts, letter = make_numeric_options(d)
+    assert d > 0 and d < 360 and a + b + c + d == 360
+    opts, let = make_numeric_options(d)
     return {
-        "question": f"Three angles of a quadrilateral are {a}°, {b}°, and {c}°. What is the fourth angle?",
-        "option_a": opts[0] + "°", "option_b": opts[1] + "°",
-        "option_c": opts[2] + "°", "option_d": opts[3] + "°",
-        "option_e": opts[4] + "°",
-        "answer": letter,
-        "explanation": f"Angles in a quadrilateral sum to 360°. Fourth = 360° − {a}° − {b}° − {c}° = {d}°.",
+        "question": (f"Three angles of a quadrilateral are {a}°, {b}°, and {c}°. "
+                     f"What is the fourth angle?"),
+        "option_a": opts[0]+"°","option_b": opts[1]+"°",
+        "option_c": opts[2]+"°","option_d": opts[3]+"°","option_e": opts[4]+"°",
+        "answer": let,
+        "explanation": (f"Angles sum to 360°: fourth angle = 360° − {a}° − {b}° − {c}° = {d}°."),
         "level": "Junior (JMC)"
     }
 
-# ── NUMBER TEMPLATES ─────────────────────────────────────────────────────────
+
+def tpl_distance_two_points():
+    a, b, c = random.choice(PYTHAGOREAN_TRIPLES)
+    s = random.randint(1, 3)
+    sa, sb, sc = a*s, b*s, c*s
+    x1, y1 = random.randint(0, 6), random.randint(0, 6)
+    x2, y2 = x1 + sa, y1 + sb
+    assert (x2-x1)**2 + (y2-y1)**2 == sc**2
+    opts, let = make_numeric_options(sc)
+    return {
+        "question": (f"What is the distance between the points ({x1}, {y1}) and ({x2}, {y2})?"),
+        "option_a": opts[0]+" units","option_b": opts[1]+" units",
+        "option_c": opts[2]+" units","option_d": opts[3]+" units","option_e": opts[4]+" units",
+        "answer": let,
+        "explanation": (f"Distance = √((x₂−x₁)²+(y₂−y₁)²) = √({x2-x1}²+{y2-y1}²) "
+                        f"= √({sa**2}+{sb**2}) = √{sc**2} = {sc} units."),
+        "level": "Intermediate (IMC)"
+    }
+
+
+def tpl_gradient_two_points():
+    m = random.choice([-4, -3, -2, -1, 1, 2, 3, 4])
+    x1 = random.randint(0, 5)
+    y1 = random.randint(0, 5)
+    dx = random.randint(1, 4)
+    x2 = x1 + dx
+    y2 = y1 + m * dx
+    assert (y2 - y1) == m * (x2 - x1)
+    opts, let = make_numeric_options(m, positive_only=False)
+    return {
+        "question": f"What is the gradient of the line passing through ({x1}, {y1}) and ({x2}, {y2})?",
+        "option_a": opts[0],"option_b": opts[1],"option_c": opts[2],
+        "option_d": opts[3],"option_e": opts[4],
+        "answer": let,
+        "explanation": (f"Gradient = (y₂−y₁)/(x₂−x₁) = ({y2}−{y1})/({x2}−{x1}) "
+                        f"= {y2-y1}/{x2-x1} = {m}."),
+        "level": "Intermediate (IMC)"
+    }
+
+
+def tpl_square_from_perimeter():
+    side = random.randint(3, 16)
+    perim = 4 * side
+    ans = side * side
+    assert 4 * side == perim and side**2 == ans
+    opts, let = make_numeric_options(ans)
+    return {
+        "question": f"A square has perimeter {perim} cm. What is its area?",
+        "option_a": opts[0]+" cm²","option_b": opts[1]+" cm²",
+        "option_c": opts[2]+" cm²","option_d": opts[3]+" cm²","option_e": opts[4]+" cm²",
+        "answer": let,
+        "explanation": (f"Side = perimeter ÷ 4 = {perim} ÷ 4 = {side} cm. "
+                        f"Area = {side}² = {ans} cm²."),
+        "level": "Junior (JMC)"
+    }
+
+
+# ── NUMBER THEORY ─────────────────────────────────────────────────────────────
 
 def tpl_last_digit_power():
     base = random.choice([2, 3, 7, 8])
-    # Find cycle length of last digit
-    cycles = {2: [2,4,8,6], 3: [3,9,7,1], 7: [7,9,3,1], 8: [8,4,2,6]}
+    cycles = {2:[2,4,8,6], 3:[3,9,7,1], 7:[7,9,3,1], 8:[8,4,2,6]}
     cycle = cycles[base]
-    period = len(cycle)
-    exp = random.choice([10, 20, 30, 40, 50, 60, 100, 200])
+    period = 4
+    exp = random.choice([10,20,30,40,50,60,100,200])
     idx = (exp % period) - 1
     if idx < 0:
         idx = period - 1
-    answer = cycle[idx]
-    assert (base ** exp) % 10 == answer
-    opts, letter = make_numeric_options(answer)
+    ans = cycle[idx]
+    assert (base ** exp) % 10 == ans
+    opts, let = make_numeric_options(ans)
     return {
         "question": f"What is the last digit of {base}^{exp}?",
-        "option_a": opts[0], "option_b": opts[1],
-        "option_c": opts[2], "option_d": opts[3], "option_e": opts[4],
-        "answer": letter,
-        "explanation": f"Powers of {base} cycle in their last digit: {', '.join(str(x) for x in cycle)}, repeating every {period}. {exp} mod {period} = {exp % period if exp % period != 0 else period}, so last digit = {answer}.",
+        "option_a": opts[0],"option_b": opts[1],"option_c": opts[2],
+        "option_d": opts[3],"option_e": opts[4],
+        "answer": let,
+        "explanation": (f"The last digits of powers of {base} cycle: "
+                        f"{', '.join(str(x) for x in cycle)}, repeating every {period}. "
+                        f"{exp} mod {period} = {exp%period if exp%period else period}, "
+                        f"so last digit = {ans}."),
         "level": "Intermediate (IMC)"
     }
+
+
+def tpl_sum_first_n():
+    n = random.choice([20, 25, 30, 40, 50, 60, 75, 80, 100])
+    ans = n * (n + 1) // 2
+    assert n * (n + 1) % 2 == 0 and n * (n + 1) // 2 == ans
+    opts, let = make_numeric_options(ans)
+    return {
+        "question": f"What is the value of 1 + 2 + 3 + ... + {n}?",
+        "option_a": opts[0],"option_b": opts[1],"option_c": opts[2],
+        "option_d": opts[3],"option_e": opts[4],
+        "answer": let,
+        "explanation": f"Sum = n(n+1)/2 = {n}×{n+1}/2 = {n*(n+1)}/2 = {ans}.",
+        "level": "Junior (JMC)"
+    }
+
+
+def tpl_sum_squares():
+    n = random.randint(5, 13)
+    ans = n * (n + 1) * (2 * n + 1) // 6
+    assert n*(n+1)*(2*n+1) % 6 == 0 and n*(n+1)*(2*n+1)//6 == ans
+    opts, let = make_numeric_options(ans)
+    return {
+        "question": f"What is the value of 1² + 2² + 3² + ... + {n}²?",
+        "option_a": opts[0],"option_b": opts[1],"option_c": opts[2],
+        "option_d": opts[3],"option_e": opts[4],
+        "answer": let,
+        "explanation": (f"Sum of squares = n(n+1)(2n+1)/6 "
+                        f"= {n}×{n+1}×{2*n+1}/6 = {n*(n+1)*(2*n+1)}/6 = {ans}."),
+        "level": "Intermediate (IMC)"
+    }
+
 
 def tpl_sum_arithmetic_sequence():
     a = random.randint(1, 10)
     d = random.randint(1, 5)
     n = random.randint(10, 25)
-    answer = n * (2 * a + (n - 1) * d) // 2
-    assert n * (2 * a + (n - 1) * d) % 2 == 0
-    assert n * (2 * a + (n - 1) * d) // 2 == answer
     last = a + (n - 1) * d
-    opts, letter = make_numeric_options(answer)
+    ans = n * (a + last) // 2
+    assert n * (a + last) % 2 == 0 and n * (a + last) // 2 == ans
+    terms_preview = f"{a}, {a+d}, {a+2*d}, ..."
+    opts, let = make_numeric_options(ans)
     return {
-        "question": f"What is the sum of the arithmetic sequence: {a}, {a+d}, {a+2*d}, ..., {last}? (There are {n} terms.)",
-        "option_a": opts[0], "option_b": opts[1],
-        "option_c": opts[2], "option_d": opts[3], "option_e": opts[4],
-        "answer": letter,
-        "explanation": f"Sum = n/2 × (first + last) = {n}/2 × ({a} + {last}) = {n}/2 × {a+last} = {answer}.",
+        "question": (f"What is the sum of the arithmetic sequence "
+                     f"{terms_preview}, {last}? (There are {n} terms.)"),
+        "option_a": opts[0],"option_b": opts[1],"option_c": opts[2],
+        "option_d": opts[3],"option_e": opts[4],
+        "answer": let,
+        "explanation": (f"Sum = n/2 × (first + last) = {n}/2 × ({a} + {last}) "
+                        f"= {n}/2 × {a+last} = {ans}."),
         "level": "Intermediate (IMC)"
     }
+
 
 def tpl_nth_term():
     a = random.randint(1, 10)
     d = random.randint(1, 6)
     n = random.randint(10, 40)
-    answer = a + (n - 1) * d
-    assert a + (n - 1) * d == answer
-    opts, letter = make_numeric_options(answer)
+    ans = a + (n - 1) * d
+    assert a + (n-1)*d == ans
+    opts, let = make_numeric_options(ans)
     return {
         "question": f"The nth term of a sequence is {a} + (n−1)×{d}. What is the {n}th term?",
-        "option_a": opts[0], "option_b": opts[1],
-        "option_c": opts[2], "option_d": opts[3], "option_e": opts[4],
-        "answer": letter,
-        "explanation": f"Substitute n = {n}: {a} + ({n}−1)×{d} = {a} + {n-1}×{d} = {a} + {(n-1)*d} = {answer}.",
+        "option_a": opts[0],"option_b": opts[1],"option_c": opts[2],
+        "option_d": opts[3],"option_e": opts[4],
+        "answer": let,
+        "explanation": (f"Substitute n = {n}: {a} + ({n}−1)×{d} = {a} + {n-1}×{d} "
+                        f"= {a} + {(n-1)*d} = {ans}."),
         "level": "Junior (JMC)"
     }
 
-def tpl_sum_squares():
-    n = random.randint(5, 12)
-    answer = n * (n + 1) * (2 * n + 1) // 6
-    assert n * (n + 1) * (2 * n + 1) % 6 == 0
-    assert n * (n + 1) * (2 * n + 1) // 6 == answer
-    opts, letter = make_numeric_options(answer)
+
+def tpl_geometric_nth_term():
+    a = random.randint(1, 4)
+    r = random.randint(2, 4)
+    n = random.randint(3, 7)
+    ans = a * r**(n-1)
+    assert a * r**(n-1) == ans
+    terms = [a * r**i for i in range(min(4, n))]
+    terms_str = ", ".join(str(t) for t in terms) + ", ..."
+    opts, let = make_numeric_options(ans)
     return {
-        "question": f"What is the value of 1² + 2² + 3² + ... + {n}²?",
-        "option_a": opts[0], "option_b": opts[1],
-        "option_c": opts[2], "option_d": opts[3], "option_e": opts[4],
-        "answer": letter,
-        "explanation": f"Sum of squares = n(n+1)(2n+1)/6 = {n}×{n+1}×{2*n+1}/6 = {n*(n+1)*(2*n+1)}/6 = {answer}.",
+        "question": (f"The geometric sequence {terms_str} has first term {a} "
+                     f"and common ratio {r}. What is the {n}th term?"),
+        "option_a": opts[0],"option_b": opts[1],"option_c": opts[2],
+        "option_d": opts[3],"option_e": opts[4],
+        "answer": let,
+        "explanation": f"nth term = a×rⁿ⁻¹ = {a}×{r}^{n-1} = {a}×{r**(n-1)} = {ans}.",
         "level": "Intermediate (IMC)"
     }
 
-def tpl_sum_first_n():
-    n = random.choice([20, 25, 30, 40, 50, 60, 75, 100])
-    answer = n * (n + 1) // 2
-    assert n * (n + 1) % 2 == 0
-    assert n * (n + 1) // 2 == answer
-    opts, letter = make_numeric_options(answer)
-    return {
-        "question": f"What is the value of 1 + 2 + 3 + ... + {n}?",
-        "option_a": opts[0], "option_b": opts[1],
-        "option_c": opts[2], "option_d": opts[3], "option_e": opts[4],
-        "answer": letter,
-        "explanation": f"Sum = n(n+1)/2 = {n}×{n+1}/2 = {n*(n+1)}/2 = {answer}.",
-        "level": "Junior (JMC)"
-    }
 
 def tpl_power_of_two_sum():
     n = random.randint(4, 10)
-    answer = 2 ** (n + 1) - 1
-    assert sum(2**i for i in range(n + 1)) == answer
-    opts, letter = make_numeric_options(answer)
+    ans = 2**(n + 1) - 1
+    assert sum(2**i for i in range(n + 1)) == ans
+    opts, let = make_numeric_options(ans)
     return {
         "question": f"What is the value of 2⁰ + 2¹ + 2² + ... + 2^{n}?",
-        "option_a": opts[0], "option_b": opts[1],
-        "option_c": opts[2], "option_d": opts[3], "option_e": opts[4],
-        "answer": letter,
-        "explanation": f"This is a geometric series. Sum = 2^(n+1) − 1 = 2^{n+1} − 1 = {2**(n+1)} − 1 = {answer}.",
+        "option_a": opts[0],"option_b": opts[1],"option_c": opts[2],
+        "option_d": opts[3],"option_e": opts[4],
+        "answer": let,
+        "explanation": (f"Geometric series with a=1, r=2: sum = 2^(n+1)−1 "
+                        f"= 2^{n+1}−1 = {2**(n+1)}−1 = {ans}."),
         "level": "Intermediate (IMC)"
     }
+
 
 def tpl_divisibility_count():
     d = random.choice([3, 4, 6, 7, 8, 9, 11, 13])
     n = random.choice([50, 100, 150, 200, 250, 500])
-    answer = n // d
-    assert n // d == answer
-    opts, letter = make_numeric_options(answer)
+    ans = n // d
+    assert n // d == ans
+    opts, let = make_numeric_options(ans)
     return {
         "question": f"How many positive integers from 1 to {n} are divisible by {d}?",
-        "option_a": opts[0], "option_b": opts[1],
-        "option_c": opts[2], "option_d": opts[3], "option_e": opts[4],
-        "answer": letter,
-        "explanation": f"Count = ⌊{n}/{d}⌋ = {answer}.",
+        "option_a": opts[0],"option_b": opts[1],"option_c": opts[2],
+        "option_d": opts[3],"option_e": opts[4],
+        "answer": let,
+        "explanation": f"Count = ⌊{n}÷{d}⌋ = {ans}.",
         "level": "Junior (JMC)"
     }
 
-def tpl_factorial_value():
-    n = random.randint(3, 7)
-    answer = math.factorial(n)
-    assert math.factorial(n) == answer
-    opts, letter = make_numeric_options(answer)
-    steps = " × ".join(str(i) for i in range(n, 0, -1))
+
+def tpl_hcf():
+    coprime_pairs = [(2,3),(2,5),(2,7),(3,4),(3,5),(3,7),(4,5),(4,7),(5,6),(5,7),(3,8),(4,9)]
+    p, q = random.choice(coprime_pairs)
+    h = random.randint(2, 12)
+    a, b = h * p, h * q
+    assert math.gcd(a, b) == h
+    opts, let = make_numeric_options(h)
     return {
-        "question": f"What is the value of {n}! (that is, {n} factorial)?",
-        "option_a": opts[0], "option_b": opts[1],
-        "option_c": opts[2], "option_d": opts[3], "option_e": opts[4],
-        "answer": letter,
-        "explanation": f"{n}! = {steps} = {answer}.",
+        "question": f"What is the highest common factor (HCF) of {a} and {b}?",
+        "option_a": opts[0],"option_b": opts[1],"option_c": opts[2],
+        "option_d": opts[3],"option_e": opts[4],
+        "answer": let,
+        "explanation": (f"{a} = {h}×{p},  {b} = {h}×{q}. "
+                        f"Since {p} and {q} share no common factor, HCF = {h}."),
         "level": "Intermediate (IMC)"
     }
+
+
+def tpl_lcm():
+    pairs = [(3,4),(3,5),(4,5),(4,6),(5,6),(5,8),(6,8),(4,9),(6,9),(8,9),
+             (5,12),(6,10),(9,12),(10,15),(8,12)]
+    a, b = random.choice(pairs)
+    ans = a * b // math.gcd(a, b)
+    assert a * b // math.gcd(a, b) == ans
+    opts, let = make_numeric_options(ans)
+    return {
+        "question": f"What is the lowest common multiple (LCM) of {a} and {b}?",
+        "option_a": opts[0],"option_b": opts[1],"option_c": opts[2],
+        "option_d": opts[3],"option_e": opts[4],
+        "answer": let,
+        "explanation": (f"LCM = (a×b) ÷ HCF({a},{b}) = ({a}×{b}) ÷ {math.gcd(a,b)} "
+                        f"= {a*b} ÷ {math.gcd(a,b)} = {ans}."),
+        "level": "Intermediate (IMC)"
+    }
+
+
+def tpl_count_factors():
+    # Verified lookup: n → factorisation string → factor count
+    data = [
+        (12, "2² × 3",       6),  (18, "2 × 3²",       6),
+        (20, "2² × 5",       6),  (24, "2³ × 3",        8),
+        (28, "2² × 7",       6),  (30, "2 × 3 × 5",     8),
+        (36, "2² × 3²",      9),  (40, "2³ × 5",        8),
+        (48, "2⁴ × 3",      10),  (50, "2 × 5²",        6),
+        (60, "2² × 3 × 5",  12),  (72, "2³ × 3²",      12),
+        (80, "2⁴ × 5",      10),  (84, "2² × 3 × 7",   12),
+        (90, "2 × 3² × 5",  12), (100, "2² × 5²",       9),
+        (120,"2³ × 3 × 5",  16), (144, "2⁴ × 3²",      15),
+    ]
+    n, factstr, ans = random.choice(data)
+    actual = len([i for i in range(1, n+1) if n % i == 0])
+    assert actual == ans
+    opts, let = make_numeric_options(ans)
+    return {
+        "question": f"How many positive factors does {n} have?",
+        "option_a": opts[0],"option_b": opts[1],"option_c": opts[2],
+        "option_d": opts[3],"option_e": opts[4],
+        "answer": let,
+        "explanation": (f"{n} = {factstr}. "
+                        f"Number of factors = product of (exponent+1) = {ans}."),
+        "level": "Intermediate (IMC)"
+    }
+
+
+def tpl_mod_remainder():
+    d = random.choice([7, 8, 9, 11, 12, 13])
+    q = random.randint(5, 20)
+    n = d * q + random.randint(1, d - 1)
+    ans = n % d
+    assert n % d == ans and 0 < ans < d
+    opts, let = make_numeric_options(ans)
+    return {
+        "question": f"What is the remainder when {n} is divided by {d}?",
+        "option_a": opts[0],"option_b": opts[1],"option_c": opts[2],
+        "option_d": opts[3],"option_e": opts[4],
+        "answer": let,
+        "explanation": f"{n} = {n//d} × {d} + {ans}. Remainder = {ans}.",
+        "level": "Junior (JMC)"
+    }
+
+
+def tpl_factorial_value():
+    n = random.randint(3, 7)
+    ans = math.factorial(n)
+    assert math.factorial(n) == ans
+    steps = " × ".join(str(i) for i in range(n, 0, -1))
+    opts, let = make_numeric_options(ans)
+    return {
+        "question": f"What is the value of {n}! ({n} factorial)?",
+        "option_a": opts[0],"option_b": opts[1],"option_c": opts[2],
+        "option_d": opts[3],"option_e": opts[4],
+        "answer": let,
+        "explanation": f"{n}! = {steps} = {ans}.",
+        "level": "Intermediate (IMC)"
+    }
+
 
 def tpl_factorial_sum():
     n = random.randint(3, 6)
-    answer = sum(math.factorial(i) for i in range(1, n + 1))
-    assert sum(math.factorial(i) for i in range(1, n + 1)) == answer
-    parts = " + ".join(f"{i}!" for i in range(1, n + 1))
-    vals = " + ".join(str(math.factorial(i)) for i in range(1, n + 1))
-    opts, letter = make_numeric_options(answer)
+    ans = sum(math.factorial(i) for i in range(1, n+1))
+    assert sum(math.factorial(i) for i in range(1, n+1)) == ans
+    terms = " + ".join(f"{math.factorial(i)}" for i in range(1, n+1))
+    opts, let = make_numeric_options(ans)
     return {
-        "question": f"What is the value of 1! + 2! + 3! + ... + {n}!?",
-        "option_a": opts[0], "option_b": opts[1],
-        "option_c": opts[2], "option_d": opts[3], "option_e": opts[4],
-        "answer": letter,
-        "explanation": f"{parts} = {vals} = {answer}.",
+        "question": f"What is 1! + 2! + 3! + ... + {n}!?",
+        "option_a": opts[0],"option_b": opts[1],"option_c": opts[2],
+        "option_d": opts[3],"option_e": opts[4],
+        "answer": let,
+        "explanation": f"= {terms} = {ans}.",
         "level": "Intermediate (IMC)"
     }
 
-# ── ALGEBRA TEMPLATES ────────────────────────────────────────────────────────
+
+def tpl_consecutive_odd_sum():
+    n = random.randint(4, 15)
+    ans = n * n
+    assert sum(2*k-1 for k in range(1, n+1)) == ans
+    last_odd = 2*n - 1
+    opts, let = make_numeric_options(ans)
+    return {
+        "question": f"What is the sum of the first {n} positive odd numbers? (1 + 3 + 5 + ... + {last_odd})",
+        "option_a": opts[0],"option_b": opts[1],"option_c": opts[2],
+        "option_d": opts[3],"option_e": opts[4],
+        "answer": let,
+        "explanation": (f"The sum of the first n odd numbers = n². "
+                        f"So the answer is {n}² = {ans}."),
+        "level": "Intermediate (IMC)"
+    }
+
+
+# ── ALGEBRA ───────────────────────────────────────────────────────────────────
 
 def tpl_linear_equation():
     a = random.randint(2, 8)
     x = random.randint(2, 15)
     b = random.randint(1, 20)
     c = a * x + b
-    assert (c - b) % a == 0
-    assert (c - b) // a == x
-    opts, letter = make_numeric_options(x)
+    assert (c - b) % a == 0 and (c - b) // a == x
+    opts, let = make_numeric_options(x)
     return {
         "question": f"If {a}x + {b} = {c}, what is the value of x?",
-        "option_a": opts[0], "option_b": opts[1],
-        "option_c": opts[2], "option_d": opts[3], "option_e": opts[4],
-        "answer": letter,
-        "explanation": f"{a}x = {c} − {b} = {c-b}. x = {c-b} ÷ {a} = {x}.",
+        "option_a": opts[0],"option_b": opts[1],"option_c": opts[2],
+        "option_d": opts[3],"option_e": opts[4],
+        "answer": let,
+        "explanation": f"{a}x = {c} − {b} = {c-b}.  x = {c-b} ÷ {a} = {x}.",
         "level": "Junior (JMC)"
     }
+
 
 def tpl_substitute_quadratic():
     a = random.randint(1, 4)
     b = random.randint(1, 6)
     x = random.randint(2, 8)
-    answer = a * x * x + b * x
-    assert a * x**2 + b * x == answer
-    opts, letter = make_numeric_options(answer)
+    ans = a * x * x + b * x
+    assert a*x**2 + b*x == ans
+    opts, let = make_numeric_options(ans)
     return {
         "question": f"If f(x) = {a}x² + {b}x, what is f({x})?",
-        "option_a": opts[0], "option_b": opts[1],
-        "option_c": opts[2], "option_d": opts[3], "option_e": opts[4],
-        "answer": letter,
-        "explanation": f"f({x}) = {a}×{x}² + {b}×{x} = {a}×{x**2} + {b*x} = {a*x**2} + {b*x} = {answer}.",
+        "option_a": opts[0],"option_b": opts[1],"option_c": opts[2],
+        "option_d": opts[3],"option_e": opts[4],
+        "answer": let,
+        "explanation": (f"f({x}) = {a}×{x}² + {b}×{x} "
+                        f"= {a}×{x**2} + {b*x} = {a*x**2} + {b*x} = {ans}."),
         "level": "Intermediate (IMC)"
     }
+
 
 def tpl_difference_of_squares():
-    a = random.randint(10, 50)
-    b = random.randint(2, 10)
-    answer = a * a - b * b
-    assert (a + b) * (a - b) == answer
-    opts, letter = make_numeric_options(answer)
+    a = random.randint(10, 60)
+    b = random.randint(2, 12)
+    ans = a*a - b*b
+    assert (a+b)*(a-b) == ans
+    opts, let = make_numeric_options(ans)
     return {
         "question": f"What is the value of {a}² − {b}²?",
-        "option_a": opts[0], "option_b": opts[1],
-        "option_c": opts[2], "option_d": opts[3], "option_e": opts[4],
-        "answer": letter,
-        "explanation": f"Using difference of squares: ({a}+{b})({a}−{b}) = {a+b} × {a-b} = {answer}.",
+        "option_a": opts[0],"option_b": opts[1],"option_c": opts[2],
+        "option_d": opts[3],"option_e": opts[4],
+        "answer": let,
+        "explanation": (f"Difference of squares: ({a}+{b})({a}−{b}) "
+                        f"= {a+b} × {a-b} = {ans}."),
         "level": "Intermediate (IMC)"
     }
 
-def tpl_consecutive_integers_sum():
-    n = random.randint(3, 7)
-    start = random.randint(5, 30)
-    answer = sum(range(start, start + n))
-    nums = ", ".join(str(i) for i in range(start, start + n))
-    assert sum(range(start, start + n)) == answer
-    opts, letter = make_numeric_options(answer)
+
+def tpl_expression_evaluation():
+    a = random.randint(2, 6)
+    b = random.randint(2, 7)
+    c = random.randint(1, 10)
+    ans = a*a*b + c
+    assert a**2*b + c == ans
+    opts, let = make_numeric_options(ans)
     return {
-        "question": f"What is the sum of the {n} consecutive integers starting at {start}? ({nums})",
-        "option_a": opts[0], "option_b": opts[1],
-        "option_c": opts[2], "option_d": opts[3], "option_e": opts[4],
-        "answer": letter,
-        "explanation": f"Sum = {n} × middle term = {n} × {start + n//2} = {answer}. (Or just add: {nums} = {answer}.)",
+        "question": f"If a = {a}, b = {b}, c = {c}, what is a²b + c?",
+        "option_a": opts[0],"option_b": opts[1],"option_c": opts[2],
+        "option_d": opts[3],"option_e": opts[4],
+        "answer": let,
+        "explanation": f"a²b + c = {a}²×{b} + {c} = {a**2}×{b} + {c} = {a**2*b} + {c} = {ans}.",
         "level": "Junior (JMC)"
     }
 
-def tpl_expression_evaluation():
-    # Evaluates something like a²b + c where a,b,c are small integers
-    a = random.randint(2, 5)
-    b = random.randint(2, 6)
-    c = random.randint(1, 10)
-    answer = a * a * b + c
-    assert a**2 * b + c == answer
-    opts, letter = make_numeric_options(answer)
+
+def tpl_expand_single_bracket():
+    a = random.randint(2, 9)
+    b = random.randint(2, 12)
+    c = random.randint(2, 12)
+    ans = a * (b + c)
+    assert a*b + a*c == ans
+    opts, let = make_numeric_options(ans)
     return {
-        "question": f"If a = {a}, b = {b}, and c = {c}, what is the value of a²b + c?",
-        "option_a": opts[0], "option_b": opts[1],
-        "option_c": opts[2], "option_d": opts[3], "option_e": opts[4],
-        "answer": letter,
-        "explanation": f"a²b + c = {a}² × {b} + {c} = {a**2} × {b} + {c} = {a**2*b} + {c} = {answer}.",
+        "question": f"Expand and evaluate: {a}({b} + {c})",
+        "option_a": opts[0],"option_b": opts[1],"option_c": opts[2],
+        "option_d": opts[3],"option_e": opts[4],
+        "answer": let,
+        "explanation": f"{a}({b} + {c}) = {a}×{b} + {a}×{c} = {a*b} + {a*c} = {ans}.",
         "level": "Junior (JMC)"
     }
+
+
+def tpl_simultaneous_equations():
+    # Build equations from solution to guarantee integer answer
+    x = random.randint(2, 8)
+    y = random.randint(1, 6)
+    a1 = random.randint(1, 4)
+    b1 = random.randint(1, 4)
+    c1 = a1*x + b1*y
+    a2 = random.randint(1, 4)
+    b2 = random.randint(1, 4)
+    # Ensure not parallel
+    for _ in range(20):
+        if a1*b2 != a2*b1:
+            break
+        a2 = random.randint(1, 4)
+        b2 = random.randint(1, 4)
+    assert a1*b2 != a2*b1, "parallel lines"
+    c2 = a2*x + b2*y
+    assert a1*x + b1*y == c1 and a2*x + b2*y == c2
+    ans = x + y
+    opts, let = make_numeric_options(ans)
+    return {
+        "question": (f"Solve the simultaneous equations:\n"
+                     f"{a1}x + {b1}y = {c1}\n"
+                     f"{a2}x + {b2}y = {c2}\n"
+                     f"What is x + y?"),
+        "option_a": opts[0],"option_b": opts[1],"option_c": opts[2],
+        "option_d": opts[3],"option_e": opts[4],
+        "answer": let,
+        "explanation": (f"The solution is x = {x}, y = {y}. "
+                        f"(Check: {a1}×{x}+{b1}×{y}={c1} ✓ and {a2}×{x}+{b2}×{y}={c2} ✓.) "
+                        f"x + y = {x} + {y} = {ans}."),
+        "level": "Intermediate (IMC)"
+    }
+
+
+def tpl_index_law_multiply():
+    base = random.choice([2, 3, 5])
+    p = random.randint(2, 6)
+    q = random.randint(2, 6)
+    ans = p + q
+    assert base**p * base**q == base**(p+q)
+    opts, let = make_numeric_options(ans)
+    return {
+        "question": f"What is n if {base}^{p} × {base}^{q} = {base}^n?",
+        "option_a": opts[0],"option_b": opts[1],"option_c": opts[2],
+        "option_d": opts[3],"option_e": opts[4],
+        "answer": let,
+        "explanation": (f"When multiplying powers of the same base, add exponents: "
+                        f"{p} + {q} = {ans}."),
+        "level": "Intermediate (IMC)"
+    }
+
+
+def tpl_index_divide():
+    base = random.choice([2, 3, 5])
+    p = random.randint(4, 9)
+    q = random.randint(1, p - 2)
+    ans = p - q
+    assert base**p // base**q == base**(p-q)
+    opts, let = make_numeric_options(ans)
+    return {
+        "question": f"What is n if {base}^{p} ÷ {base}^{q} = {base}^n?",
+        "option_a": opts[0],"option_b": opts[1],"option_c": opts[2],
+        "option_d": opts[3],"option_e": opts[4],
+        "answer": let,
+        "explanation": (f"When dividing powers of the same base, subtract exponents: "
+                        f"{p} − {q} = {ans}."),
+        "level": "Intermediate (IMC)"
+    }
+
+
+def tpl_solve_power():
+    base = random.choice([2, 3, 4, 5])
+    exp = random.randint(2, 6)
+    ans = base ** exp
+    assert base**exp == ans
+    steps = " × ".join([str(base)] * exp)
+    opts, let = make_numeric_options(ans)
+    return {
+        "question": f"What is the value of {base}^{exp}?",
+        "option_a": opts[0],"option_b": opts[1],"option_c": opts[2],
+        "option_d": opts[3],"option_e": opts[4],
+        "answer": let,
+        "explanation": f"{base}^{exp} = {steps} = {ans}.",
+        "level": "Junior (JMC)"
+    }
+
+
+def tpl_powers_arithmetic():
+    a = random.randint(2, 4)
+    b = random.randint(2, 5)
+    c = random.randint(2, 7)
+    ans = a**b * c
+    assert a**b * c == ans
+    opts, let = make_numeric_options(ans)
+    return {
+        "question": f"What is the value of {a}^{b} × {c}?",
+        "option_a": opts[0],"option_b": opts[1],"option_c": opts[2],
+        "option_d": opts[3],"option_e": opts[4],
+        "answer": let,
+        "explanation": f"{a}^{b} = {a**b}. Then {a**b} × {c} = {ans}.",
+        "level": "Junior (JMC)"
+    }
+
 
 # ── PERCENTAGE / RATIO ────────────────────────────────────────────────────────
 
 def tpl_percentage_of():
-    p = random.choice([10, 15, 20, 25, 30, 40, 50, 60, 75, 80])
-    # Make sure answer is a whole number
-    n = random.choice([20, 40, 60, 80, 100, 120, 160, 200, 240, 300, 400])
-    answer = p * n // 100
-    assert p * n % 100 == 0
-    assert p * n // 100 == answer
-    opts, letter = make_numeric_options(answer)
+    p = random.choice([10,15,20,25,30,40,50,60,75,80])
+    n = random.choice([20,40,60,80,100,120,160,200,240,300,400])
+    assert p*n % 100 == 0
+    ans = p * n // 100
+    opts, let = make_numeric_options(ans)
     return {
         "question": f"What is {p}% of {n}?",
-        "option_a": opts[0], "option_b": opts[1],
-        "option_c": opts[2], "option_d": opts[3], "option_e": opts[4],
-        "answer": letter,
-        "explanation": f"{p}% of {n} = ({p}/100) × {n} = {answer}.",
+        "option_a": opts[0],"option_b": opts[1],"option_c": opts[2],
+        "option_d": opts[3],"option_e": opts[4],
+        "answer": let,
+        "explanation": f"{p}% of {n} = ({p}/100) × {n} = {ans}.",
         "level": "Junior (JMC)"
     }
 
+
 def tpl_reverse_percentage():
-    p = random.choice([10, 20, 25, 30, 40, 50])
-    orig = random.choice([40, 60, 80, 100, 120, 160, 200, 240])
-    sale = orig * (100 - p) // 100
-    assert orig * (100 - p) % 100 == 0
-    assert sale * 100 // (100 - p) == orig
-    opts, letter = make_numeric_options(orig)
+    p = random.choice([10,20,25,30,40,50])
+    orig = random.choice([40,60,80,100,120,160,200,240])
+    assert orig*(100-p) % 100 == 0
+    sale = orig * (100-p) // 100
+    assert sale * 100 // (100-p) == orig
+    opts, let = make_numeric_options(orig)
     return {
         "question": f"After a {p}% discount, an item costs £{sale}. What was the original price?",
-        "option_a": "£" + opts[0], "option_b": "£" + opts[1],
-        "option_c": "£" + opts[2], "option_d": "£" + opts[3], "option_e": "£" + opts[4],
-        "answer": letter,
-        "explanation": f"Original × (1 − {p}/100) = £{sale}. Original = £{sale} ÷ {(100-p)/100} = £{orig}.",
+        "option_a": "£"+opts[0],"option_b": "£"+opts[1],
+        "option_c": "£"+opts[2],"option_d": "£"+opts[3],"option_e": "£"+opts[4],
+        "answer": let,
+        "explanation": (f"Sale price = original × (1 − {p}/100). "
+                        f"Original = £{sale} ÷ {(100-p)/100} = £{orig}."),
         "level": "Intermediate (IMC)"
     }
 
+
 def tpl_percentage_increase():
-    orig = random.choice([50, 60, 80, 100, 120, 150, 200])
-    p = random.choice([10, 20, 25, 30, 40, 50])
-    answer = orig * (100 + p) // 100
-    assert orig * (100 + p) % 100 == 0
-    assert orig * (100 + p) // 100 == answer
-    opts, letter = make_numeric_options(answer)
+    orig = random.choice([60,80,100,120,160,200,240])  # removed 50,150 (break with p=25)
+    p = random.choice([10,20,25,30,40,50])
+    assert orig*(100+p) % 100 == 0
+    ans = orig*(100+p)//100
+    opts, let = make_numeric_options(ans)
     return {
-        "question": f"A price of £{orig} is increased by {p}%. What is the new price?",
-        "option_a": "£" + opts[0], "option_b": "£" + opts[1],
-        "option_c": "£" + opts[2], "option_d": "£" + opts[3], "option_e": "£" + opts[4],
-        "answer": letter,
-        "explanation": f"New price = £{orig} × (1 + {p}/100) = £{orig} × {(100+p)/100} = £{answer}.",
+        "question": f"A price of £{orig} increases by {p}%. What is the new price?",
+        "option_a": "£"+opts[0],"option_b": "£"+opts[1],
+        "option_c": "£"+opts[2],"option_d": "£"+opts[3],"option_e": "£"+opts[4],
+        "answer": let,
+        "explanation": f"£{orig} × (1 + {p}/100) = £{orig} × {(100+p)/100} = £{ans}.",
         "level": "Junior (JMC)"
     }
+
 
 def tpl_ratio_sharing():
     a = random.randint(1, 5)
@@ -657,343 +1042,502 @@ def tpl_ratio_sharing():
     while a == b:
         b = random.randint(1, 5)
     total_parts = a + b
-    # Make sure total divides cleanly
-    total = total_parts * random.randint(4, 15)
-    larger_ratio = max(a, b)
-    answer = larger_ratio * total // total_parts
-    assert (a + b) * (total // (a + b)) == total
-    assert larger_ratio * total // total_parts == answer
-    opts, letter = make_numeric_options(answer)
+    total = total_parts * random.randint(4, 20)
+    larger = max(a, b)
+    ans = larger * total // total_parts
+    assert larger * total % total_parts == 0 and larger * total // total_parts == ans
+    opts, let = make_numeric_options(ans)
     return {
-        "question": f"£{total} is shared between two people in the ratio {a}:{b}. What is the larger share?",
-        "option_a": "£" + opts[0], "option_b": "£" + opts[1],
-        "option_c": "£" + opts[2], "option_d": "£" + opts[3], "option_e": "£" + opts[4],
-        "answer": letter,
-        "explanation": f"Each part = £{total} ÷ {total_parts} = £{total//total_parts}. Larger share = {larger_ratio} × £{total//total_parts} = £{answer}.",
+        "question": f"£{total} is shared in the ratio {a}:{b}. What is the larger share?",
+        "option_a": "£"+opts[0],"option_b": "£"+opts[1],
+        "option_c": "£"+opts[2],"option_d": "£"+opts[3],"option_e": "£"+opts[4],
+        "answer": let,
+        "explanation": (f"Each part = £{total} ÷ {total_parts} = £{total//total_parts}. "
+                        f"Larger share = {larger} × £{total//total_parts} = £{ans}."),
         "level": "Junior (JMC)"
     }
+
 
 def tpl_speed_distance_time():
     s = random.randint(20, 90)
     t = random.randint(2, 5)
-    answer = s * t
-    assert s * t == answer
-    opts, letter = make_numeric_options(answer)
+    ans = s * t
+    assert s*t == ans
+    opts, let = make_numeric_options(ans)
     return {
         "question": f"A car travels at {s} km/h for {t} hours. How far does it travel?",
-        "option_a": opts[0] + " km", "option_b": opts[1] + " km",
-        "option_c": opts[2] + " km", "option_d": opts[3] + " km",
-        "option_e": opts[4] + " km",
-        "answer": letter,
-        "explanation": f"Distance = speed × time = {s} × {t} = {answer} km.",
+        "option_a": opts[0]+" km","option_b": opts[1]+" km",
+        "option_c": opts[2]+" km","option_d": opts[3]+" km","option_e": opts[4]+" km",
+        "answer": let,
+        "explanation": f"Distance = speed × time = {s} × {t} = {ans} km.",
         "level": "Junior (JMC)"
     }
 
+
 def tpl_speed_time_from_distance():
-    # How long does it take?
-    d = random.choice([60, 90, 120, 150, 180, 240, 300])
-    s = random.choice([30, 40, 50, 60])
-    t = d // s
-    if d % s != 0:
-        d = s * 3
-        t = 3
-    assert d == s * t
-    opts, letter = make_numeric_options(t)
+    s = random.choice([30,40,50,60])
+    t = random.randint(2, 5)
+    d = s * t
+    assert d // s == t and d % s == 0
+    opts, let = make_numeric_options(t)
     return {
         "question": f"A car travels {d} km at {s} km/h. How many hours does the journey take?",
-        "option_a": opts[0] + " hours", "option_b": opts[1] + " hours",
-        "option_c": opts[2] + " hours", "option_d": opts[3] + " hours",
-        "option_e": opts[4] + " hours",
-        "answer": letter,
+        "option_a": opts[0]+" h","option_b": opts[1]+" h",
+        "option_c": opts[2]+" h","option_d": opts[3]+" h","option_e": opts[4]+" h",
+        "answer": let,
         "explanation": f"Time = distance ÷ speed = {d} ÷ {s} = {t} hours.",
         "level": "Junior (JMC)"
     }
 
-# ── PROBABILITY ───────────────────────────────────────────────────────────────
+
+def tpl_profit_percentage():
+    pct = random.choice([10,20,25,30,40,50])
+    cost = random.choice([40,60,80,100,200,400])  # removed 50 (breaks with pct=25)
+    assert cost*pct % 100 == 0
+    profit = cost*pct//100
+    selling = cost + profit
+    ans = pct
+    assert (selling - cost)*100 // cost == ans
+    opts, let = make_numeric_options(ans)
+    return {
+        "question": (f"An item is bought for £{cost} and sold for £{selling}. "
+                     f"What is the percentage profit?"),
+        "option_a": opts[0]+"%","option_b": opts[1]+"%",
+        "option_c": opts[2]+"%","option_d": opts[3]+"%","option_e": opts[4]+"%",
+        "answer": let,
+        "explanation": (f"Profit = £{selling} − £{cost} = £{profit}. "
+                        f"Percentage profit = ({profit}/{cost}) × 100 = {ans}%."),
+        "level": "Intermediate (IMC)"
+    }
+
+
+def tpl_compound_interest():
+    # Hardcoded combos verified to be exact integers
+    combos = [
+        (100, 10, 1, 110),  (200, 10, 1, 220),  (500, 10, 1, 550),
+        (1000,10, 1, 1100), (100, 20, 1, 120),  (200, 20, 1, 240),
+        (100, 10, 2, 121),  (200, 10, 2, 242),  (1000,10, 2, 1210),
+        (100, 20, 2, 144),  (500, 20, 2, 720),  (400, 25, 2, 625),
+        (100, 50, 2, 225),  (800, 25, 2, 1250),
+    ]
+    P, r, n, ans = random.choice(combos)
+    # Floating point safe check
+    computed = P
+    for _ in range(n):
+        computed = computed * (100 + r) // 100
+    assert computed == ans
+    yr = "year" if n == 1 else "years"
+    opts, let = make_numeric_options(ans)
+    return {
+        "question": (f"£{P} is invested at {r}% compound interest per year. "
+                     f"What is the total amount after {n} {yr}?"),
+        "option_a": "£"+opts[0],"option_b": "£"+opts[1],
+        "option_c": "£"+opts[2],"option_d": "£"+opts[3],"option_e": "£"+opts[4],
+        "answer": let,
+        "explanation": (f"Amount = P × (1 + r/100)^n = £{P} × (1.{r:02d})^{n} = £{ans}."),
+        "level": "Intermediate (IMC)"
+    }
+
+
+# ── FRACTIONS ─────────────────────────────────────────────────────────────────
+
+def tpl_fraction_add():
+    denom_pairs = [(2,3),(2,5),(3,4),(3,5),(4,5),(2,7),(3,7),(4,7),(5,6),(3,8)]
+    b, d = random.choice(denom_pairs)
+    a = random.randint(1, b-1)
+    c = random.randint(1, d-1)
+    result = Fraction(a, b) + Fraction(c, d)
+    num, den = result.numerator, result.denominator
+    assert Fraction(num, den) == Fraction(a,b) + Fraction(c,d)
+    opts, let = make_fraction_options(num, den)
+    return {
+        "question": f"What is {a}/{b} + {c}/{d}? (Give your answer as a fraction in its simplest form.)",
+        "option_a": opts[0],"option_b": opts[1],"option_c": opts[2],
+        "option_d": opts[3],"option_e": opts[4],
+        "answer": let,
+        "explanation": (f"{a}/{b} + {c}/{d} = {a*d}/({b*d}) + {b*c}/({b*d}) "
+                        f"= {a*d+b*c}/{b*d} = {num}/{den}."),
+        "level": "Intermediate (IMC)"
+    }
+
+
+def tpl_fraction_multiply():
+    # Pick fractions that simplify nicely
+    combos = [
+        (2,3,3,4),(3,4,4,5),(2,5,5,6),(3,5,5,9),(2,7,7,8),
+        (3,4,8,9),(4,5,5,8),(2,3,3,8),(5,6,6,7),(3,8,4,9),
+    ]
+    a,b,c,d = random.choice(combos)
+    result = Fraction(a,b) * Fraction(c,d)
+    num, den = result.numerator, result.denominator
+    assert Fraction(num,den) == Fraction(a,b)*Fraction(c,d)
+    opts, let = make_fraction_options(num, den)
+    return {
+        "question": f"What is {a}/{b} × {c}/{d}? (Give your answer as a fraction in its simplest form.)",
+        "option_a": opts[0],"option_b": opts[1],"option_c": opts[2],
+        "option_d": opts[3],"option_e": opts[4],
+        "answer": let,
+        "explanation": (f"{a}/{b} × {c}/{d} = {a*c}/{b*d} = {num}/{den} "
+                        f"(dividing by their HCF)."),
+        "level": "Intermediate (IMC)"
+    }
+
+
+def tpl_fraction_divide():
+    combos = [
+        (2,3,4,5),(3,4,6,7),(2,5,4,5),(3,5,9,10),(1,2,3,4),
+        (4,5,8,9),(2,7,6,7),(5,6,5,9),(3,8,9,16),(2,3,8,9),
+    ]
+    a,b,c,d = random.choice(combos)
+    result = Fraction(a,b) / Fraction(c,d)
+    num, den = result.numerator, result.denominator
+    assert Fraction(num,den) == Fraction(a,b)/Fraction(c,d)
+    opts, let = make_fraction_options(num, den)
+    return {
+        "question": f"What is {a}/{b} ÷ {c}/{d}? (Give your answer as a fraction in its simplest form.)",
+        "option_a": opts[0],"option_b": opts[1],"option_c": opts[2],
+        "option_d": opts[3],"option_e": opts[4],
+        "answer": let,
+        "explanation": (f"{a}/{b} ÷ {c}/{d} = {a}/{b} × {d}/{c} "
+                        f"= {a*d}/{b*c} = {num}/{den}."),
+        "level": "Intermediate (IMC)"
+    }
+
+
+# ── PROBABILITY / COMBINATORICS ───────────────────────────────────────────────
 
 def tpl_simple_probability():
-    r = random.randint(2, 6)
-    b = random.randint(2, 6)
-    g = random.randint(2, 6)
+    r = random.randint(2, 7)
+    b = random.randint(2, 7)
+    g = random.randint(2, 7)
     total = r + b + g
-    # Pick whichever colour gives simplest fraction
-    opts, letter = make_fraction_options(r, total)
+    opts, let = make_fraction_options(r, total)
     return {
-        "question": f"A bag contains {r} red, {b} blue, and {g} green balls. A ball is chosen at random. What is the probability it is red?",
-        "option_a": opts[0], "option_b": opts[1],
-        "option_c": opts[2], "option_d": opts[3], "option_e": opts[4],
-        "answer": letter,
+        "question": (f"A bag contains {r} red, {b} blue, and {g} green balls. "
+                     f"A ball is chosen at random. What is the probability it is red?"),
+        "option_a": opts[0],"option_b": opts[1],"option_c": opts[2],
+        "option_d": opts[3],"option_e": opts[4],
+        "answer": let,
         "explanation": f"P(red) = {r}/{total} = {Fraction(r, total)}.",
         "level": "Junior (JMC)"
     }
 
+
+def tpl_probability_complement():
+    r = random.randint(2, 8)
+    total = random.randint(r+3, 20)
+    # P(not red) = (total-r)/total
+    num = total - r
+    den = total
+    opts, let = make_fraction_options(num, den)
+    return {
+        "question": (f"A bag has {r} red balls and {total-r} blue balls. "
+                     f"What is the probability of NOT picking a red ball?"),
+        "option_a": opts[0],"option_b": opts[1],"option_c": opts[2],
+        "option_d": opts[3],"option_e": opts[4],
+        "answer": let,
+        "explanation": (f"P(not red) = 1 − P(red) = 1 − {r}/{total} "
+                        f"= {total-r}/{total} = {Fraction(num, den)}."),
+        "level": "Junior (JMC)"
+    }
+
+
 def tpl_permutations():
     n = random.randint(3, 6)
-    answer = math.factorial(n)
-    assert math.factorial(n) == answer
-    opts, letter = make_numeric_options(answer)
+    ans = math.factorial(n)
+    assert math.factorial(n) == ans
     steps = " × ".join(str(i) for i in range(n, 0, -1))
+    opts, let = make_numeric_options(ans)
     return {
-        "question": f"In how many different ways can {n} people be arranged in a line?",
-        "option_a": opts[0], "option_b": opts[1],
-        "option_c": opts[2], "option_d": opts[3], "option_e": opts[4],
-        "answer": letter,
-        "explanation": f"Number of arrangements = {n}! = {steps} = {answer}.",
+        "question": f"In how many different orders can {n} people be arranged in a line?",
+        "option_a": opts[0],"option_b": opts[1],"option_c": opts[2],
+        "option_d": opts[3],"option_e": opts[4],
+        "answer": let,
+        "explanation": f"Number of arrangements = {n}! = {steps} = {ans}.",
         "level": "Intermediate (IMC)"
     }
+
 
 def tpl_combinations():
     n = random.randint(5, 10)
     r = random.randint(2, 4)
-    answer = math.comb(n, r)
-    assert math.comb(n, r) == answer
-    opts, letter = make_numeric_options(answer)
+    ans = math.comb(n, r)
+    assert math.comb(n, r) == ans
+    opts, let = make_numeric_options(ans)
     return {
         "question": f"How many ways can {r} items be chosen from {n} distinct items (order doesn't matter)?",
-        "option_a": opts[0], "option_b": opts[1],
-        "option_c": opts[2], "option_d": opts[3], "option_e": opts[4],
-        "answer": letter,
-        "explanation": f"C({n},{r}) = {n}! / ({r}! × {n-r}!) = {answer}.",
+        "option_a": opts[0],"option_b": opts[1],"option_c": opts[2],
+        "option_d": opts[3],"option_e": opts[4],
+        "answer": let,
+        "explanation": f"C({n},{r}) = {n}! / ({r}! × {n-r}!) = {ans}.",
         "level": "Intermediate (IMC)"
     }
 
-# ── DATA / STATISTICS ─────────────────────────────────────────────────────────
+
+# ── STATISTICS ────────────────────────────────────────────────────────────────
 
 def tpl_mean():
-    vals = sorted([random.randint(5, 20) for _ in range(5)])
-    total = sum(vals)
-    n = len(vals)
-    answer = total // n
-    if total % n != 0:
-        # Adjust last value to make mean clean
-        vals[-1] = answer * n - sum(vals[:-1])
-        total = sum(vals)
-    assert sum(vals) % n == 0
-    assert sum(vals) // n == answer
-    opts, letter = make_numeric_options(answer)
+    n = 5
+    target = random.randint(8, 18)
+    vals = [random.randint(4, 20) for _ in range(n-1)]
+    last = target * n - sum(vals)
+    if last <= 0 or last > 30:
+        vals = [10, 12, 14, 16]
+        target = 14
+        last = target*n - sum(vals)
+    vals = sorted(vals + [last])
+    assert sum(vals) == target * n
+    opts, let = make_numeric_options(target)
     return {
-        "question": f"What is the mean of the numbers {', '.join(str(v) for v in vals)}?",
-        "option_a": opts[0], "option_b": opts[1],
-        "option_c": opts[2], "option_d": opts[3], "option_e": opts[4],
-        "answer": letter,
-        "explanation": f"Mean = sum ÷ count = {total} ÷ {n} = {answer}.",
+        "question": f"What is the mean of {', '.join(str(v) for v in vals)}?",
+        "option_a": opts[0],"option_b": opts[1],"option_c": opts[2],
+        "option_d": opts[3],"option_e": opts[4],
+        "answer": let,
+        "explanation": f"Mean = {sum(vals)} ÷ {n} = {target}.",
         "level": "Junior (JMC)"
     }
+
 
 def tpl_find_missing_for_mean():
-    known = [random.randint(5, 20) for _ in range(4)]
-    target_mean = random.randint(10, 18)
     n = 5
-    missing = target_mean * n - sum(known)
-    if missing <= 0 or missing > 30:
+    target = random.randint(10, 18)
+    known = sorted([random.randint(5, 22) for _ in range(n-1)])
+    missing = target * n - sum(known)
+    if missing <= 0 or missing > 35:
         known = [10, 12, 14, 16]
-        target_mean = 15
-        missing = target_mean * 5 - sum(known)
-    assert sum(known + [missing]) == target_mean * n
-    opts, letter = make_numeric_options(missing)
+        target = 15
+        missing = target * n - sum(known)
+    assert sum(known) + missing == target * n
+    opts, let = make_numeric_options(missing)
     return {
-        "question": f"The mean of five numbers is {target_mean}. Four of the numbers are {', '.join(str(k) for k in known)}. What is the fifth number?",
-        "option_a": opts[0], "option_b": opts[1],
-        "option_c": opts[2], "option_d": opts[3], "option_e": opts[4],
-        "answer": letter,
-        "explanation": f"Total = {target_mean} × {n} = {target_mean*n}. Sum of four known = {sum(known)}. Fifth = {target_mean*n} − {sum(known)} = {missing}.",
-        "level": "Junior (JMC)"
-    }
-
-# ── POWERS & INDICES ──────────────────────────────────────────────────────────
-
-def tpl_powers_arithmetic():
-    a = random.randint(2, 4)
-    b = random.randint(2, 5)
-    c = random.randint(2, 6)
-    answer = a ** b * c
-    assert a**b * c == answer
-    opts, letter = make_numeric_options(answer)
-    return {
-        "question": f"What is the value of {a}^{b} × {c}?",
-        "option_a": opts[0], "option_b": opts[1],
-        "option_c": opts[2], "option_d": opts[3], "option_e": opts[4],
-        "answer": letter,
-        "explanation": f"{a}^{b} = {a**b}. Then {a**b} × {c} = {answer}.",
-        "level": "Junior (JMC)"
-    }
-
-def tpl_index_law_multiply():
-    base = random.choice([2, 3, 5])
-    p = random.randint(2, 6)
-    q = random.randint(2, 6)
-    answer = p + q
-    assert base**p * base**q == base**(p+q)
-    opts, letter = make_numeric_options(answer)
-    return {
-        "question": f"What is the value of n if {base}^{p} × {base}^{q} = {base}^n?",
-        "option_a": opts[0], "option_b": opts[1],
-        "option_c": opts[2], "option_d": opts[3], "option_e": opts[4],
-        "answer": letter,
-        "explanation": f"When multiplying powers of the same base, add exponents: {p} + {q} = {answer}.",
-        "level": "Intermediate (IMC)"
-    }
-
-def tpl_solve_power_equation():
-    base = random.choice([2, 3, 4, 5])
-    exp = random.randint(2, 6)
-    answer = base ** exp
-    assert answer == base**exp
-    opts, letter = make_numeric_options(answer)
-    return {
-        "question": f"What is the value of {base}^{exp}?",
-        "option_a": opts[0], "option_b": opts[1],
-        "option_c": opts[2], "option_d": opts[3], "option_e": opts[4],
-        "answer": letter,
-        "explanation": f"{base}^{exp} = {' × '.join([str(base)]*exp)} = {answer}.",
+        "question": (f"The mean of five numbers is {target}. "
+                     f"Four of them are {', '.join(str(k) for k in known)}. "
+                     f"What is the fifth?"),
+        "option_a": opts[0],"option_b": opts[1],"option_c": opts[2],
+        "option_d": opts[3],"option_e": opts[4],
+        "answer": let,
+        "explanation": (f"Total = {target}×{n} = {target*n}. "
+                        f"Sum of known = {sum(known)}. "
+                        f"Fifth = {target*n} − {sum(known)} = {missing}."),
         "level": "Junior (JMC)"
     }
 
 
-# ── MASTER LIST ───────────────────────────────────────────────────────────────
+def tpl_median():
+    n = random.choice([5, 7, 9])
+    vals = sorted([random.randint(1, 25) for _ in range(n)])
+    ans = vals[n // 2]
+    assert sorted(vals)[n//2] == ans
+    shuffled = vals[:]
+    random.shuffle(shuffled)
+    opts, let = make_numeric_options(ans)
+    return {
+        "question": f"What is the median of the data set: {', '.join(str(v) for v in shuffled)}?",
+        "option_a": opts[0],"option_b": opts[1],"option_c": opts[2],
+        "option_d": opts[3],"option_e": opts[4],
+        "answer": let,
+        "explanation": (f"Ordered: {', '.join(str(v) for v in vals)}. "
+                        f"The middle ({n//2+1}{['st','nd','rd','th'][min(n//2,3)]} of {n}) value is {ans}."),
+        "level": "Junior (JMC)"
+    }
+
+
+def tpl_range_data():
+    vals = [random.randint(1, 30) for _ in range(random.randint(5, 8))]
+    ans = max(vals) - min(vals)
+    assert max(vals) - min(vals) == ans
+    opts, let = make_numeric_options(ans)
+    return {
+        "question": f"What is the range of the data set: {', '.join(str(v) for v in vals)}?",
+        "option_a": opts[0],"option_b": opts[1],"option_c": opts[2],
+        "option_d": opts[3],"option_e": opts[4],
+        "answer": let,
+        "explanation": f"Range = max − min = {max(vals)} − {min(vals)} = {ans}.",
+        "level": "Junior (JMC)"
+    }
+
+
+def tpl_square_root():
+    n = random.choice([4,9,16,25,36,49,64,81,100,121,144,169,196,225,256,289,324,361,400])
+    ans = int(math.isqrt(n))
+    assert ans * ans == n
+    opts, let = make_numeric_options(ans)
+    return {
+        "question": f"What is √{n}?",
+        "option_a": opts[0],"option_b": opts[1],"option_c": opts[2],
+        "option_d": opts[3],"option_e": opts[4],
+        "answer": let,
+        "explanation": f"√{n} = {ans} because {ans}² = {n}.",
+        "level": "Junior (JMC)"
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MASTER TEMPLATE LIST
+# ─────────────────────────────────────────────────────────────────────────────
 
 ALL_TEMPLATES = [
-    # Geometry
-    tpl_rectangle_area, tpl_circle_area, tpl_circle_circumference,
-    tpl_cube_surface_area, tpl_cube_volume, tpl_cylinder_volume,
+    # Geometry (18)
+    tpl_rectangle_area, tpl_triangle_area_bh, tpl_trapezoid_area,
+    tpl_circle_area, tpl_circle_circumference, tpl_cube_surface_area,
+    tpl_cube_volume, tpl_cylinder_volume, tpl_sphere_surface_area,
     tpl_right_triangle_hypotenuse, tpl_right_triangle_leg,
     tpl_interior_angle_polygon, tpl_exterior_angle_polygon,
-    tpl_triangle_missing_angle, tpl_isosceles_triangle_angle,
-    tpl_quadrilateral_missing_angle,
-    # Number
-    tpl_last_digit_power, tpl_sum_arithmetic_sequence, tpl_nth_term,
-    tpl_sum_squares, tpl_sum_first_n, tpl_power_of_two_sum,
-    tpl_divisibility_count, tpl_factorial_value, tpl_factorial_sum,
-    # Algebra
+    tpl_triangle_missing_angle, tpl_quadrilateral_missing_angle,
+    tpl_distance_two_points, tpl_gradient_two_points, tpl_square_from_perimeter,
+    # Number theory (15)
+    tpl_last_digit_power, tpl_sum_first_n, tpl_sum_squares,
+    tpl_sum_arithmetic_sequence, tpl_nth_term, tpl_geometric_nth_term,
+    tpl_power_of_two_sum, tpl_divisibility_count, tpl_hcf, tpl_lcm,
+    tpl_count_factors, tpl_mod_remainder, tpl_factorial_value,
+    tpl_factorial_sum, tpl_consecutive_odd_sum,
+    # Algebra (11)
     tpl_linear_equation, tpl_substitute_quadratic, tpl_difference_of_squares,
-    tpl_consecutive_integers_sum, tpl_expression_evaluation,
-    # Percentage / ratio
+    tpl_expression_evaluation, tpl_expand_single_bracket,
+    tpl_simultaneous_equations, tpl_index_law_multiply, tpl_index_divide,
+    tpl_solve_power, tpl_powers_arithmetic, tpl_square_root,
+    # Percentage / ratio / money (8)
     tpl_percentage_of, tpl_reverse_percentage, tpl_percentage_increase,
     tpl_ratio_sharing, tpl_speed_distance_time, tpl_speed_time_from_distance,
-    # Probability / combinatorics
-    tpl_simple_probability, tpl_permutations, tpl_combinations,
-    # Statistics
-    tpl_mean, tpl_find_missing_for_mean,
-    # Powers
-    tpl_powers_arithmetic, tpl_index_law_multiply, tpl_solve_power_equation,
+    tpl_profit_percentage, tpl_compound_interest,
+    # Fractions (3)
+    tpl_fraction_add, tpl_fraction_multiply, tpl_fraction_divide,
+    # Probability / combinatorics (4)
+    tpl_simple_probability, tpl_probability_complement,
+    tpl_permutations, tpl_combinations,
+    # Statistics (4)
+    tpl_mean, tpl_find_missing_for_mean, tpl_median, tpl_range_data,
 ]
+# Total: 63 templates
 
 
-def generate_from_template():
-    """Pick a random template, run it, return a verified question dict."""
-    random.shuffle(ALL_TEMPLATES)
-    for tpl_fn in ALL_TEMPLATES:
-        try:
-            result = tpl_fn()
-            if result:
+def generate_from_template(exclude_hashes=None):
+    """
+    Try each template in random order.
+    Skip if it generates a duplicate question (by hash).
+    Returns a verified question dict, or None if all fail.
+    """
+    if exclude_hashes is None:
+        exclude_hashes = set()
+    order = ALL_TEMPLATES[:]
+    random.shuffle(order)
+    for fn in order:
+        for _attempt in range(5):   # 5 fresh random draws per template
+            try:
+                result = fn()
+                if not result:
+                    continue
+                h = q_hash(result['question'])
+                if h in exclude_hashes or hash_exists(h):
+                    continue        # already seen — try another draw
+                result['question_hash'] = h
                 return result
-        except AssertionError as e:
-            continue  # template generated bad values, try next
-        except Exception as e:
-            print(f"⚠️ Template {tpl_fn.__name__} error: {e}")
-            continue
+            except AssertionError:
+                continue            # template chose bad numbers — retry
+            except Exception as e:
+                print(f"⚠️ Template {fn.__name__}: {e}")
+                continue
     return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# AI PROMPT (used as 30% fallback)
+# AI SYSTEM  (50 % of questions — heavily regulated)
 # ─────────────────────────────────────────────────────────────────────────────
 
-UKMT_PROMPT = """You are an expert UKMT question writer. Generate ONE original UKMT-style multiple choice question.
+UKMT_PROMPT = """You are an expert UKMT question writer with deep knowledge of all past UKMT papers.
 
-TODAY'S LEVEL: {level}
+Generate ONE original UKMT-style multiple choice question at level: {level}
 
-STRICT RULES:
-- 5 options A, B, C, D, E — exactly one correct
-- Must be genuinely UKMT style — elegant, needs insight
-- Triple-check your arithmetic before outputting
-- Include a verify_expr: a Python expression using only +,-,*,/,**,% and math functions that evaluates to True when the answer is correct. Examples:
-  - "12 * 14 == 168"
-  - "(5**2 + 12**2)**0.5 == 13.0"
-  - "(10-2)*180//10 == 144"
-  - "sum(range(1,101)) == 5050"
+ABSOLUTE REQUIREMENTS:
+1. Exactly 5 options A–E, exactly one correct.
+2. UKMT style: elegant, requires insight or a clever trick — not just blind calculation.
+3. Triple-check your arithmetic. Then check again.
+4. You MUST provide a verify_expr: a standalone Python expression that evaluates to True
+   when the answer is correct. Use only basic Python maths.
 
-Respond ONLY in this exact JSON, no other text, no markdown:
-{
-  "question": "full question text",
-  "option_a": "value",
-  "option_b": "value",
-  "option_c": "value",
-  "option_d": "value",
-  "option_e": "value",
+   Good examples:
+   - "12 * 14 == 168"
+   - "(5**2 + 12**2)**0.5 == 13.0"
+   - "(8-2)*180 // 8 == 135"
+   - "sum(range(1,101)) == 5050"
+   - "(1000 - 100*3) % 7 == 2"
+
+5. Distractors must be PLAUSIBLE — common mistakes should lead to them.
+
+Respond ONLY in this exact JSON (no markdown, no preamble):
+{{
+  "question": "full question text here",
+  "option_a": "...",
+  "option_b": "...",
+  "option_c": "...",
+  "option_d": "...",
+  "option_e": "...",
   "answer": "A",
-  "explanation": "clear step-by-step solution",
-  "verify_expr": "python expression that returns True",
+  "explanation": "clear step-by-step solution showing why others are wrong",
+  "verify_expr": "python expression → True",
   "level": "{level}"
-}"""
+}}"""
 
 
-def safe_verify(expr):
+def safe_eval_verify(expr):
     """
-    Safely evaluate a verify_expr using ast whitelisting.
-    Returns True if the expression evaluates to True.
-    Returns None if the expression is unsafe or errors.
+    Safely evaluate a verify_expr.
+    Returns True  → expression is True (arithmetic confirmed)
+    Returns False → expression is provably False (wrong answer)
+    Returns None  → expression can't be evaluated safely (can't confirm either way)
     """
     if not expr or not isinstance(expr, str):
         return None
     try:
         tree = ast.parse(expr, mode='eval')
-        ALLOWED_NODES = {
+        SAFE_NODES = {
             ast.Expression, ast.BoolOp, ast.BinOp, ast.UnaryOp,
             ast.Compare, ast.Constant, ast.Add, ast.Sub, ast.Mult,
-            ast.Div, ast.Pow, ast.Mod, ast.FloorDiv, ast.Eq, ast.NotEq,
-            ast.Lt, ast.LtE, ast.Gt, ast.GtE, ast.And, ast.Or, ast.Not,
-            ast.USub, ast.UAdd, ast.Call, ast.Name, ast.Load, ast.Num,
-            ast.Attribute
+            ast.Div, ast.Pow, ast.Mod, ast.FloorDiv, ast.BitAnd,
+            ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE,
+            ast.And, ast.Or, ast.Not, ast.USub, ast.UAdd,
+            ast.Call, ast.Name, ast.Load, ast.Num, ast.Attribute,
         }
         for node in ast.walk(tree):
-            if type(node) not in ALLOWED_NODES:
-                print(f"⚠️ Unsafe AST node: {type(node).__name__}")
+            if type(node) not in SAFE_NODES:
+                print(f"⚠️ Unsafe AST node: {type(node).__name__} — skipping verify")
                 return None
-        safe_globals = {
+        safe_env = {
             "__builtins__": {},
-            "math": math,
-            "abs": abs,
-            "round": round,
-            "int": int,
-            "float": float,
-            "sum": sum,
-            "range": range,
-            "min": min,
-            "max": max,
-            "sqrt": math.sqrt,
-            "factorial": math.factorial,
-            "comb": math.comb,
-            "gcd": math.gcd,
+            "math": math, "abs": abs, "round": round,
+            "int": int, "float": float,
+            "sum": sum, "range": range, "min": min, "max": max,
+            "sqrt": math.sqrt, "factorial": math.factorial,
+            "comb": math.comb, "gcd": math.gcd, "pow": pow,
         }
-        result = eval(compile(tree, '<verify>', 'eval'), safe_globals)
+        result = eval(compile(tree, '<verify>', 'eval'), safe_env)
         return bool(result)
     except Exception as e:
-        print(f"⚠️ verify_expr eval error: {e} | expr: {expr}")
+        print(f"⚠️ verify_expr eval error: {e}")
         return None
 
 
 def ai_second_opinion(data):
     """
-    Ask a second AI call to independently solve the question.
-    Returns corrected data if it disagrees, original data if it agrees,
-    or None if the question seems fundamentally broken.
+    Ask a SECOND independent AI call to solve the question.
+    Returns (agrees: bool, corrected_data: dict).
+    Always called — not just on failure.
     """
     try:
-        prompt = f"""Solve this maths question independently. Show your working step by step, then state the correct answer letter.
-
-Question: {data['question']}
-A) {data['option_a']}
-B) {data['option_b']}
-C) {data['option_c']}
-D) {data['option_d']}
-E) {data['option_e']}
-
-Respond ONLY in JSON, no other text:
-{{"working": "your step by step working", "answer": "A", "agrees_with_stated": true}}
-
-The stated answer is {data['answer']}. Set agrees_with_stated to true if you agree, false if not."""
-
+        prompt = (
+            f"Solve this maths question carefully. Show full working, then give the correct answer letter.\n\n"
+            f"Question: {data['question']}\n"
+            f"A) {data['option_a']}\n"
+            f"B) {data['option_b']}\n"
+            f"C) {data['option_c']}\n"
+            f"D) {data['option_d']}\n"
+            f"E) {data['option_e']}\n\n"
+            f"The STATED answer is {data['answer']}.\n\n"
+            f"Respond ONLY in JSON (no markdown):\n"
+            f'{{ "working": "step by step", "my_answer": "A", '
+            f'"agrees": true }}\n'
+            f"Set agrees to true if your answer matches the stated answer, false if not."
+        )
         resp = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[{"role": "user", "content": prompt}],
@@ -1005,150 +1549,163 @@ The stated answer is {data['answer']}. Set agrees_with_stated to true if you agr
             raw = raw[raw.index('{'):raw.rindex('}')+1]
         result = json.loads(raw)
 
-        if result.get('agrees_with_stated'):
-            print(f"✅ Second opinion agrees: {data['answer']}")
-            return data
+        if result.get('agrees'):
+            return True, data
 
-        actual = result.get('answer', '').strip().upper()
-        if actual in ['A', 'B', 'C', 'D', 'E'] and actual != data['answer']:
-            print(f"⚠️ Second opinion: stated={data['answer']}, actual={actual}. Correcting.")
-            data['answer'] = actual
+        their_ans = result.get('my_answer', '').strip().upper()
+        if their_ans in 'ABCDE' and len(their_ans) == 1 and their_ans != data['answer']:
+            print(f"⚠️ Second opinion differs: stated={data['answer']}, checker={their_ans}. Auto-correcting.")
+            data = dict(data)
+            data['answer']      = their_ans
             data['explanation'] = result.get('working', data['explanation'])
-            return data
+            return False, data
 
-        return data  # can't determine, accept original
+        return True, data   # can't determine — trust original
 
     except Exception as e:
-        print(f"⚠️ Second opinion failed: {e}")
-        return data
+        print(f"⚠️ Second opinion exception: {e}")
+        return True, data   # if second opinion crashes, accept original
 
 
-def generate_ai_question(level):
-    """Generate a question using AI with verification. Returns dict or None."""
-    for attempt in range(3):
+def generate_ai_question(level, exclude_hashes=None):
+    """
+    Generate a question using AI.
+    Regulation pipeline:
+      1. Must return valid JSON with all fields + verify_expr
+      2. Python evaluates verify_expr
+         - True  → second opinion still called (always)
+         - False → second opinion called, auto-correct attempted
+         - None  → second opinion called
+      3. Second opinion must agree (or auto-correct)
+      4. Re-verify after any correction
+      5. Uniqueness check
+      6. Up to 5 attempts before giving up
+    """
+    if exclude_hashes is None:
+        exclude_hashes = set()
+
+    for attempt in range(5):
         try:
             resp = client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
                 messages=[{"role": "user", "content": UKMT_PROMPT.format(level=level)}],
-                temperature=0.7,
-                max_tokens=1200
+                temperature=0.75,
+                max_tokens=1400
             )
             raw = resp.choices[0].message.content.strip()
             if '{' in raw:
                 raw = raw[raw.index('{'):raw.rindex('}')+1]
             data = json.loads(raw)
 
-            # Step 1: Python checks the verify_expr
-            verify_result = safe_verify(data.get('verify_expr', ''))
+            # --- Sanity: all required fields present ---
+            required = ['question','option_a','option_b','option_c','option_d',
+                        'option_e','answer','explanation','verify_expr']
+            if not all(data.get(k) for k in required):
+                print(f"⚠️ Attempt {attempt+1}: missing fields")
+                continue
+            if data['answer'] not in 'ABCDE' or len(data['answer']) != 1:
+                print(f"⚠️ Attempt {attempt+1}: bad answer letter")
+                continue
 
-            if verify_result is False:
-                # Arithmetic is provably wrong — ask second AI to fix it
-                print(f"⚠️ Attempt {attempt+1}: verify_expr returned False. Sending to second opinion.")
-                data = ai_second_opinion(data)
-                if data is None:
-                    continue
-                # Re-verify after correction
-                verify_result = safe_verify(data.get('verify_expr', ''))
-                if verify_result is False:
-                    print(f"⚠️ Still wrong after second opinion. Retrying.")
-                    continue
+            # --- Step 1: Python verify_expr ---
+            v1 = safe_eval_verify(data.get('verify_expr', ''))
+            if v1 is False:
+                print(f"⚠️ Attempt {attempt+1}: verify_expr=False → sending to second opinion")
 
-            elif verify_result is None:
-                # Can't verify — use second opinion as extra check
-                print(f"ℹ️ Attempt {attempt+1}: verify_expr unverifiable. Using second opinion.")
-                data = ai_second_opinion(data)
-                if data is None:
-                    continue
+            # --- Step 2: Second opinion (ALWAYS) ---
+            agreed, data = ai_second_opinion(data)
 
-            # verify_result is True or None-but-second-opinion-checked
+            # --- Step 3: Re-verify after potential correction ---
+            if not agreed:
+                v2 = safe_eval_verify(data.get('verify_expr', ''))
+                if v2 is False:
+                    print(f"⚠️ Attempt {attempt+1}: still wrong after correction. Retrying.")
+                    continue
+            elif v1 is False:
+                # verify failed but second opinion agreed — still reject
+                print(f"⚠️ Attempt {attempt+1}: verify False + second agrees but math wrong. Retrying.")
+                continue
+
+            # --- Step 4: Uniqueness ---
+            h = q_hash(data['question'])
+            if h in exclude_hashes or hash_exists(h):
+                print(f"ℹ️ Attempt {attempt+1}: duplicate question, retrying.")
+                continue
+
+            data['question_hash'] = h
+            print(f"✅ AI question passed all checks (attempt {attempt+1})")
             return data
 
         except json.JSONDecodeError as e:
-            print(f"⚠️ JSON parse failed attempt {attempt+1}: {e}")
+            print(f"⚠️ Attempt {attempt+1}: JSON parse error: {e}")
         except Exception as e:
-            print(f"❌ AI attempt {attempt+1} failed: {e}")
+            print(f"❌ Attempt {attempt+1} exception: {e}")
 
+    print("❌ AI: all 5 attempts failed — will use template fallback")
     return None
 
 
 def pick_level():
     r = random.random()
-    if r < 0.65:
+    if r < 0.55:
         return "Intermediate (IMC)"
-    elif r < 0.85:
-        return random.choice(["Junior (JMC)", "Intermediate (IMC)"])
+    elif r < 0.80:
+        return "Junior (JMC)"
     else:
         return "Senior (SMC)"
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN GENERATION LOGIC
+# ─────────────────────────────────────────────────────────────────────────────
+
 def generate_question():
     """
-    Main question generation function.
-    70% template (Python-verified, arithmetically perfect).
-    30% AI (with Python verify_expr + second AI opinion).
+    50 % template (Python-verified, arithmetically perfect, 63 templates).
+    50 % AI (verify_expr + second opinion + uniqueness check).
+    Guaranteed fallback to template if AI fails.
+    Guaranteed unique question every day.
     """
     today = date.today().isoformat()
     conn = get_db()
-    existing = conn.execute('SELECT id FROM questions WHERE date = ?', (today,)).fetchone()
+    existing = conn.execute(
+        'SELECT id FROM questions WHERE date = ?', (today,)
+    ).fetchone()
     conn.close()
     if existing:
         return
 
-    # ── 70% TEMPLATE PATH ────────────────────────────────────────────────────
-    if random.random() < 0.70:
+    use_ai = random.random() < 0.50
+    level  = pick_level()
+    source = 'ai' if use_ai else 'template'
+    data   = None
+
+    if use_ai:
+        data = generate_ai_question(level)
+
+    if data is None:
+        source = 'template' if not use_ai else 'template_fallback'
         data = generate_from_template()
-        if data:
-            conn = get_db()
-            conn.execute(
-                '''INSERT OR IGNORE INTO questions
-                   (date, question, option_a, option_b, option_c, option_d, option_e,
-                    answer, explanation, level, source)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                (today, data['question'], data['option_a'], data['option_b'],
-                 data['option_c'], data['option_d'], data['option_e'],
-                 data['answer'], data['explanation'], data['level'], 'template')
-            )
-            conn.commit()
-            conn.close()
-            print(f"✅ Template question for {today} [{data['level']}]")
-            return
 
-    # ── 30% AI PATH ───────────────────────────────────────────────────────────
-    level = pick_level()
-    data = generate_ai_question(level)
-
-    if data:
-        conn = get_db()
-        conn.execute(
-            '''INSERT OR IGNORE INTO questions
-               (date, question, option_a, option_b, option_c, option_d, option_e,
-                answer, explanation, level, source)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-            (today, data['question'], data['option_a'], data['option_b'],
-             data['option_c'], data['option_d'], data['option_e'],
-             data['answer'], data['explanation'], data.get('level', level), 'ai')
-        )
-        conn.commit()
-        conn.close()
-        print(f"✅ AI question for {today} [{level}]")
+    if data is None:
+        print("❌ CRITICAL: both AI and template failed. No question today.")
         return
 
-    # ── FALLBACK: template always works ─────────────────────────────────────
-    data = generate_from_template()
-    if data:
-        conn = get_db()
-        conn.execute(
-            '''INSERT OR IGNORE INTO questions
-               (date, question, option_a, option_b, option_c, option_d, option_e,
-                answer, explanation, level, source)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-            (today, data['question'], data['option_a'], data['option_b'],
-             data['option_c'], data['option_d'], data['option_e'],
-             data['answer'], data['explanation'], data['level'], 'template_fallback')
-        )
-        conn.commit()
-        conn.close()
-        print(f"✅ Fallback template question for {today}")
+    conn = get_db()
+    conn.execute(
+        '''INSERT OR IGNORE INTO questions
+           (date, question, question_hash, option_a, option_b, option_c,
+            option_d, option_e, answer, explanation, level, source)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+        (today, data['question'], data.get('question_hash', q_hash(data['question'])),
+         data['option_a'], data['option_b'], data['option_c'],
+         data['option_d'], data['option_e'],
+         data['answer'], data['explanation'],
+         data.get('level', level), source)
+    )
+    conn.commit()
+    conn.close()
+    print(f"✅ [{source}] Question saved for {today} — level: {data.get('level', level)}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1159,18 +1716,20 @@ def send_discord(mc_username, discord_username, answer, is_correct, question_tex
     if not DISCORD_WEBHOOK:
         return
     import requests as req
-    color = 0x6BCF7F if is_correct else 0xFF6B6B
+    colour = 0x6BCF7F if is_correct else 0xFF6B6B
     payload = {
         "embeds": [{
             "title": "📐 New UKMT Submission!",
-            "color": color,
+            "color": colour,
             "fields": [
-                {"name": "Minecraft Username", "value": mc_username, "inline": True},
-                {"name": "Discord Username",   "value": discord_username, "inline": True},
-                {"name": "Answer Submitted",   "value": answer, "inline": True},
+                {"name": "Minecraft Username", "value": mc_username,     "inline": True},
+                {"name": "Discord Username",   "value": discord_username,"inline": True},
+                {"name": "Answer",             "value": answer,          "inline": True},
                 {"name": "Result", "value": "✅ Correct!" if is_correct else "❌ Wrong", "inline": True},
-                {"name": "Date", "value": date_str, "inline": True},
-                {"name": "Question", "value": question_text[:200] + ("..." if len(question_text) > 200 else ""), "inline": False},
+                {"name": "Date",               "value": date_str,        "inline": True},
+                {"name": "Question",
+                 "value": question_text[:200] + ("…" if len(question_text) > 200 else ""),
+                 "inline": False},
             ],
             "timestamp": datetime.utcnow().isoformat()
         }]
@@ -1191,7 +1750,7 @@ scheduler.start()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ROUTES
+# FLASK ROUTES
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.route('/')
@@ -1199,17 +1758,19 @@ def home():
     generate_question()
     return render_template('index.html')
 
+
 @app.route('/sw.js')
 def service_worker():
     return send_from_directory('static', 'sw.js', mimetype='application/javascript')
 
+
 @app.route('/question')
 def get_question():
-    today = date.today().isoformat()
+    today     = date.today().isoformat()
     yesterday = (date.today() - timedelta(days=1)).isoformat()
 
     conn = get_db()
-    q = conn.execute('SELECT * FROM questions WHERE date = ?', (today,)).fetchone()
+    q  = conn.execute('SELECT * FROM questions WHERE date = ?', (today,)).fetchone()
     yq = conn.execute('SELECT * FROM questions WHERE date = ?', (yesterday,)).fetchone()
     conn.close()
 
@@ -1220,31 +1781,32 @@ def get_question():
         conn.close()
 
     if not q:
-        return jsonify({'error': 'No question available yet'}), 404
+        return jsonify({'error': 'Question not yet available'}), 404
 
     return jsonify({
         'today': {
-            'date': q['date'],
+            'date':     q['date'],
             'question': q['question'],
             'option_a': q['option_a'],
             'option_b': q['option_b'],
             'option_c': q['option_c'],
             'option_d': q['option_d'],
             'option_e': q['option_e'],
-            'level': q['level'],
+            'level':    q['level'],
         },
         'yesterday': {
-            'date': yq['date'],
-            'question': yq['question'],
-            'answer': yq['answer'],
+            'date':        yq['date'],
+            'question':    yq['question'],
+            'answer':      yq['answer'],
             'explanation': yq['explanation'],
-            'level': yq['level'],
+            'level':       yq['level'],
         } if yq else None
     })
 
+
 @app.route('/submit', methods=['POST'])
 def submit():
-    data = request.get_json()
+    data             = request.get_json()
     mc_username      = data.get('mc_username', '').strip()
     discord_username = data.get('discord_username', '').strip()
     answer           = data.get('answer', '').strip().upper()
@@ -1254,10 +1816,10 @@ def submit():
         return jsonify({'success': False, 'error': 'Minecraft username required'})
     if not discord_username:
         return jsonify({'success': False, 'error': 'Discord username required'})
-    if answer not in ['A', 'B', 'C', 'D', 'E']:
+    if answer not in list('ABCDE'):
         return jsonify({'success': False, 'error': 'Invalid answer'})
     if len(mc_username) > 16:
-        return jsonify({'success': False, 'error': 'Minecraft username too long'})
+        return jsonify({'success': False, 'error': 'Minecraft username too long (max 16)'})
     if len(discord_username) > 40:
         return jsonify({'success': False, 'error': 'Discord username too long'})
 
@@ -1277,26 +1839,28 @@ def submit():
         return jsonify({'success': False, 'error': 'No question found for today'})
 
     is_correct = int(answer == q['answer'])
-
     conn.execute(
-        '''INSERT INTO submissions (date, mc_username, discord_username, answer, is_correct, submitted_at)
+        '''INSERT INTO submissions
+           (date, mc_username, discord_username, answer, is_correct, submitted_at)
            VALUES (?, ?, ?, ?, ?, ?)''',
         (today, mc_username, discord_username, answer, is_correct, int(time.time()))
     )
     conn.commit()
     conn.close()
 
-    send_discord(mc_username, discord_username, answer, bool(is_correct), q['question'], today)
+    send_discord(mc_username, discord_username, answer,
+                 bool(is_correct), q['question'], today)
 
     return jsonify({'success': True, 'correct': bool(is_correct)})
+
 
 @app.route('/leaderboard')
 def leaderboard():
     conn = get_db()
     users = conn.execute('''
         SELECT mc_username,
-               COUNT(*)      AS total,
-               SUM(is_correct) AS correct
+               COUNT(*)         AS total,
+               SUM(is_correct)  AS correct
         FROM submissions
         GROUP BY mc_username
         ORDER BY correct DESC, total ASC
@@ -1304,6 +1868,7 @@ def leaderboard():
     ''').fetchall()
     conn.close()
     return jsonify([dict(u) for u in users])
+
 
 @app.route('/feedback-cooldown', methods=['GET'])
 def feedback_cooldown():
@@ -1315,9 +1880,10 @@ def feedback_cooldown():
     conn.close()
     if not row:
         return jsonify({'remaining': 0})
-    elapsed = int(time.time()) - row['last_submitted']
+    elapsed   = int(time.time()) - row['last_submitted']
     remaining = max(0, FEEDBACK_COOLDOWN - elapsed)
     return jsonify({'remaining': remaining * 1000})
+
 
 @app.route('/set-feedback-cooldown', methods=['POST'])
 def set_feedback_cooldown():
@@ -1331,7 +1897,6 @@ def set_feedback_cooldown():
     conn.close()
     return jsonify({'success': True})
 
-# ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
     app.run(debug=False)
