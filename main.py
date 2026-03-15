@@ -1862,10 +1862,13 @@ def deliver_pending_rewards(mc_username):
 
     for row in rows:
         give_cmd = f"give {mc_username} minecraft:{row['item']} {row['amount']}"
+        earned = row['earned_date']
+        label = row['label']
+        earned = row['earned_date']
+        label = row['label']
         msg_cmd  = (
             f'tellraw {mc_username} [{{"text":"[UKMT] ","color":"gold","bold":true}},'
-            f'{{"text":"Pending reward from {row[\"earned_date\"]}: '
-            f'{row[\"label\"]}","color":"yellow"}}]'
+            f'{{"text":"Pending reward from {earned}: {label}","color":"yellow"}}]'
         )
         run_rcon(give_cmd)
         run_rcon(msg_cmd)
