@@ -64,7 +64,7 @@ def init_db():
         )''')
     except Exception:
         pass
-conn.execute('''CREATE TABLE IF NOT EXISTS submissions (
+    conn.execute('''CREATE TABLE IF NOT EXISTS submissions (
         id              INTEGER PRIMARY KEY AUTOINCREMENT,
         date            TEXT,
         mc_username     TEXT,
