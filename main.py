@@ -53,7 +53,7 @@ def init_db():
         conn.execute('CREATE INDEX IF NOT EXISTS idx_question_hash ON questions(question_hash)')
     except Exception:
         pass
-    conn.execute('''CREATE TABLE IF NOT EXISTS submissions (
+conn.execute('''CREATE TABLE IF NOT EXISTS submissions (
         id              INTEGER PRIMARY KEY AUTOINCREMENT,
         date            TEXT,
         mc_username     TEXT,
@@ -61,6 +61,11 @@ def init_db():
         answer          TEXT,
         is_correct      INTEGER,
         submitted_at    INTEGER
+    )''')
+    conn.execute('''CREATE TABLE IF NOT EXISTS player_streaks (
+        mc_username     TEXT PRIMARY KEY,
+        current_streak  INTEGER DEFAULT 0,
+        last_correct    TEXT DEFAULT NULL
     )''')
     conn.execute('''CREATE TABLE IF NOT EXISTS feedback_cooldowns (
         ip              TEXT PRIMARY KEY,
@@ -73,6 +78,21 @@ init_db()
 
 FEEDBACK_COOLDOWN = 48 * 60 * 60
 
+RCON_HOST     = os.environ.get('RCON_HOST')
+RCON_PORT     = int(os.environ.get('RCON_PORT', 25575))
+RCON_PASSWORD = os.environ.get('RCON_PASSWORD')
+
+# Streak rewards — index 0 = day 1, index 6 = day 7
+# After day 7 it loops back to day 7's reward forever
+STREAK_REWARDS = [
+    {"day": 1, "item": "diamond",        "amount": 1,  "label": "1 Diamond"},
+    {"day": 2, "item": "cooked_porkchop","amount": 16, "label": "16 Cooked Porkchops"},
+    {"day": 3, "item": "diamond",        "amount": 5,  "label": "5 Diamonds"},
+    {"day": 4, "item": "golden_apple",   "amount": 1,  "label": "1 Golden Apple"},
+    {"day": 5, "item": "iron_block",     "amount": 1,  "label": "1 Iron Block"},
+    {"day": 6, "item": "diamond",        "amount": 10, "label": "10 Diamonds"},
+    {"day": 7, "item": "ancient_debris", "amount": 1,  "label": "1 Ancient Debris"},
+]
 
 def q_hash(question_text):
     """Stable hash for deduplication."""
@@ -1711,6 +1731,110 @@ def generate_question():
 # ─────────────────────────────────────────────────────────────────────────────
 # DISCORD WEBHOOK
 # ─────────────────────────────────────────────────────────────────────────────
+def run_rcon(command):
+    """Send a command to the Minecraft server via RCON. Returns output or None."""
+    if not RCON_HOST or not RCON_PASSWORD:
+        print("⚠️ RCON not configured — skipping command")
+        return None
+    try:
+        from mcrcon import MCRcon
+        with MCRcon(RCON_HOST, RCON_PASSWORD, port=RCON_PORT) as mcr:
+            response = mcr.command(command)
+            return response
+    except Exception as e:
+        print(f"❌ RCON error: {e}")
+        return None
+
+
+def get_player_streak(mc_username):
+    conn = get_db()
+    row = conn.execute(
+        'SELECT current_streak, last_correct FROM player_streaks WHERE mc_username = ?',
+        (mc_username,)
+    ).fetchone()
+    conn.close()
+    if not row:
+        return 0, None
+    return row['current_streak'], row['last_correct']
+
+
+def update_player_streak(mc_username, correct, today):
+    """
+    Update streak for player.
+    correct=True  → increment streak (or start at 1 if they missed yesterday)
+    correct=False → reset to 0
+    Returns new streak value.
+    """
+    conn = get_db()
+    row = conn.execute(
+        'SELECT current_streak, last_correct FROM player_streaks WHERE mc_username = ?',
+        (mc_username,)
+    ).fetchone()
+
+    if not correct:
+        conn.execute(
+            '''INSERT INTO player_streaks (mc_username, current_streak, last_correct)
+               VALUES (?, 0, ?)
+               ON CONFLICT(mc_username) DO UPDATE SET current_streak=0''',
+            (mc_username, today)
+        )
+        conn.commit()
+        conn.close()
+        return 0
+
+    yesterday = (date.today() - timedelta(days=1)).isoformat()
+
+    if not row:
+        new_streak = 1
+    elif row['last_correct'] == yesterday:
+        new_streak = row['current_streak'] + 1
+    elif row['last_correct'] == today:
+        # Already updated today somehow
+        new_streak = row['current_streak']
+    else:
+        # Missed a day — reset streak to 1
+        new_streak = 1
+
+    conn.execute(
+        '''INSERT INTO player_streaks (mc_username, current_streak, last_correct)
+           VALUES (?, ?, ?)
+           ON CONFLICT(mc_username) DO UPDATE SET
+               current_streak = excluded.current_streak,
+               last_correct   = excluded.last_correct''',
+        (mc_username, new_streak, today)
+    )
+    conn.commit()
+    conn.close()
+    return new_streak
+
+
+def give_streak_reward(mc_username, streak):
+    """
+    Give the reward for this streak day via RCON.
+    Streak 1-7, then stays at day 7 reward forever.
+    """
+    idx = min(streak, 7) - 1          # clamp to 0-6
+    reward = STREAK_REWARDS[idx]
+
+    give_cmd = f"give {mc_username} minecraft:{reward['item']} {reward['amount']}"
+    msg_cmd  = (
+        f'tellraw {mc_username} [{{"text":"[UKMT] ","color":"gold","bold":true}},'
+        f'{{"text":"Day {streak} streak! You earned: {reward[\"label\"]}","color":"yellow"}}]'
+    )
+
+    run_rcon(give_cmd)
+    run_rcon(msg_cmd)
+    print(f"✅ RCON: gave {mc_username} {reward['label']} (streak day {streak})")
+
+
+def send_wrong_answer_message(mc_username):
+    """Send a consolation message for a wrong answer."""
+    msg_cmd = (
+        f'tellraw {mc_username} [{{"text":"[UKMT] ","color":"red","bold":true}},'
+        f'{{"text":"Better luck next time! Your streak has been reset.","color":"white"}}]'
+    )
+    run_rcon(msg_cmd)
+
 
 def send_discord(mc_username, discord_username, answer, is_correct, question_text, date_str):
     if not DISCORD_WEBHOOK:
@@ -1851,8 +1975,28 @@ def submit():
     send_discord(mc_username, discord_username, answer,
                  bool(is_correct), q['question'], today)
 
-    return jsonify({'success': True, 'correct': bool(is_correct)})
+    # ── STREAK & RCON REWARDS ────────────────────────────────────────────────
+    new_streak = update_player_streak(mc_username, bool(is_correct), today)
 
+    if is_correct:
+        give_streak_reward(mc_username, new_streak)
+        reward_idx = min(new_streak, 7) - 1
+        reward_label = STREAK_REWARDS[reward_idx]['label']
+    else:
+        send_wrong_answer_message(mc_username)
+        reward_label = None
+
+    return jsonify({
+        'success':      True,
+        'correct':      bool(is_correct),
+        'streak':       new_streak,
+        'reward':       reward_label,
+    })
+
+@app.route('/streak/<mc_username>')
+def get_streak(mc_username):
+    streak, last = get_player_streak(mc_username)
+    return jsonify({'streak': streak, 'last_correct': last})
 
 @app.route('/leaderboard')
 def leaderboard():
