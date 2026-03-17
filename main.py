@@ -1408,6 +1408,20 @@ def tpl_square_root():
 # MASTER TEMPLATE LIST
 # ─────────────────────────────────────────────────────────────────────────────
 
+INTERMEDIATE_SENIOR_TEMPLATES = [
+    tpl_trapezoid_area, tpl_cylinder_volume, tpl_sphere_surface_area,
+    tpl_interior_angle_polygon, tpl_exterior_angle_polygon,
+    tpl_distance_two_points, tpl_gradient_two_points,
+    tpl_last_digit_power, tpl_sum_squares, tpl_sum_arithmetic_sequence,
+    tpl_geometric_nth_term, tpl_power_of_two_sum, tpl_hcf, tpl_lcm,
+    tpl_count_factors, tpl_factorial_value, tpl_factorial_sum,
+    tpl_consecutive_odd_sum, tpl_substitute_quadratic, tpl_difference_of_squares,
+    tpl_simultaneous_equations, tpl_index_law_multiply, tpl_index_divide,
+    tpl_reverse_percentage, tpl_profit_percentage, tpl_compound_interest,
+    tpl_fraction_add, tpl_fraction_multiply, tpl_fraction_divide,
+    tpl_permutations, tpl_combinations,
+]
+
 ALL_TEMPLATES = [
     # Geometry (18)
     tpl_rectangle_area, tpl_triangle_area_bh, tpl_trapezoid_area,
@@ -1451,7 +1465,7 @@ def generate_from_template(exclude_hashes=None):
     """
     if exclude_hashes is None:
         exclude_hashes = set()
-    order = ALL_TEMPLATES[:]
+    order = (INTERMEDIATE_SENIOR_TEMPLATES * 3 + ALL_TEMPLATES)[:]
     random.shuffle(order)
     for fn in order:
         for _attempt in range(5):   # 5 fresh random draws per template
@@ -1679,12 +1693,12 @@ def generate_ai_question(level, exclude_hashes=None):
 
 def pick_level():
     r = random.random()
-    if r < 0.55:
+    if r < 0.70:
         return "Intermediate (IMC)"
-    elif r < 0.80:
-        return "Junior (JMC)"
-    else:
+    elif r < 0.90:
         return "Senior (SMC)"
+    else:
+        return "Junior (JMC)"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
