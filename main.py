@@ -1477,7 +1477,7 @@ def generate_from_template(exclude_hashes=None):
 # ─────────────────────────────────────────────────────────────────────────────
 
 UKMT_PROMPT = """You are an expert UKMT question writer with deep knowledge of all past UKMT papers.
-
+You work for BrainBrawl.
 Generate ONE original UKMT-style multiple choice question at level: {level}
 
 ABSOLUTE REQUIREMENTS:
