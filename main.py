@@ -2107,6 +2107,23 @@ def get_streak(mc_username):
     streak, last = get_player_streak(mc_username)
     return jsonify({'streak': streak, 'last_correct': last})
 
+@app.route('/pending-rewards-list')
+def pending_rewards_list():
+    conn = get_db()
+    rows = conn.execute('SELECT * FROM pending_rewards').fetchall()
+    conn.close()
+    result = []
+    for row in rows:
+        result.append({
+            'mc_username': row['mc_username'],
+            'discord_username': '(check submissions)',
+            'item': row['item'],
+            'amount': row['amount'],
+            'label': row['label'],
+            'earned_date': row['earned_date']
+        })
+    return jsonify(result)
+
 @app.route('/leaderboard')
 def leaderboard():
     conn = get_db()
