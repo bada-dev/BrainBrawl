@@ -2135,7 +2135,7 @@ def pending_rewards_list():
     for row in rows:
         result.append({
             'mc_username': row['mc_username'],
-            'discord_username': '(check submissions)',
+            'discord_username': conn.execute('SELECT discord_username FROM submissions WHERE mc_username = ? ORDER BY submitted_at DESC LIMIT 1', (row['mc_username'],)).fetchone()['discord_username'] if conn.execute('SELECT discord_username FROM submissions WHERE mc_username = ? ORDER BY submitted_at DESC LIMIT 1', (row['mc_username'],)).fetchone() else 'unknown',,
             'item': row['item'],
             'amount': row['amount'],
             'label': row['label'],
