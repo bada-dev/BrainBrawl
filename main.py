@@ -1947,7 +1947,7 @@ def send_discord(mc_username, discord_username, answer, is_correct, question_tex
     colour = 0x6BCF7F if is_correct else 0xFF6B6B
     payload = {
         "embeds": [{
-            "title": "📐 New UKMT Submission!",
+            "title": "📐 New BrainBrawl Submission!",
             "color": colour,
             "fields": [
                 {"name": "Minecraft Username", "value": mc_username,     "inline": True},
