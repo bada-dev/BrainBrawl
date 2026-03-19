@@ -16,6 +16,8 @@ app = Flask(__name__)
 
 GROQ_API_KEY  = os.environ.get('GROQ_API_KEY')
 DISCORD_WEBHOOK = os.environ.get('DISCORD_WEBHOOK')
+DISCORD_BOT_TOKEN          = os.environ.get('DISCORD_BOT_TOKEN')
+DISCORD_CONSOLE_CHANNEL_ID = os.environ.get('DISCORD_CONSOLE_CHANNEL_ID')
 client = Groq(api_key=GROQ_API_KEY)
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -44,11 +46,10 @@ def init_db():
         level           TEXT,
         source          TEXT DEFAULT "template"
     )''')
-    # Add question_hash column to existing DBs that were created without it
     try:
         conn.execute('ALTER TABLE questions ADD COLUMN question_hash TEXT')
     except Exception:
-        pass  # column already exists
+        pass
     try:
         conn.execute('CREATE INDEX IF NOT EXISTS idx_question_hash ON questions(question_hash)')
     except Exception:
@@ -94,8 +95,6 @@ RCON_HOST     = os.environ.get('RCON_HOST')
 RCON_PORT     = int(os.environ.get('RCON_PORT', 25575))
 RCON_PASSWORD = os.environ.get('RCON_PASSWORD')
 
-# Streak rewards — index 0 = day 1, index 6 = day 7
-# After day 7 it loops back to day 7's reward forever
 STREAK_REWARDS = [
     {"day": 1, "item": "diamond",        "amount": 1,  "label": "1 Diamond"},
     {"day": 2, "item": "cooked_porkchop","amount": 16, "label": "16 Cooked Porkchops"},
@@ -107,13 +106,11 @@ STREAK_REWARDS = [
 ]
 
 def q_hash(question_text):
-    """Stable hash for deduplication."""
     normalised = question_text.lower().strip()
     return hashlib.md5(normalised.encode()).hexdigest()
 
 
 def hash_exists(h):
-    """Return True if this question hash is already in the DB."""
     conn = get_db()
     row = conn.execute(
         'SELECT id FROM questions WHERE question_hash = ?', (h,)
@@ -127,10 +124,6 @@ def hash_exists(h):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def make_numeric_options(correct, positive_only=True):
-    """
-    Generate 4 plausible wrong answers, return (list_of_5_strings, answer_letter).
-    Deltas are scaled to the magnitude of the answer so distractors are believable.
-    """
     cv = int(correct) if isinstance(correct, float) and correct == int(correct) else correct
     mag = max(abs(cv), 1)
 
@@ -154,7 +147,6 @@ def make_numeric_options(correct, positive_only=True):
         if w != cv and (not positive_only or w > 0):
             wrongs.add(w)
 
-    # Safety fallback
     step = max(mag // 4, 1)
     attempts = 1
     while len(wrongs) < 4:
@@ -173,7 +165,6 @@ def make_numeric_options(correct, positive_only=True):
 
 
 def make_pi_options(correct_base):
-    """For answers expressed as N·π — correct_base is the integer coefficient."""
     cb = int(correct_base)
     if cb <= 6:
         pool = [1,2,3,4,5,6,8,9,10,12]
@@ -193,13 +184,11 @@ def make_pi_options(correct_base):
 
 
 def make_fraction_options(num, den):
-    """Generate 5 fraction options, one correct."""
     from math import gcd
     g = gcd(abs(num), abs(den))
     correct_str = f"{num // g}/{den // g}"
     seen = {correct_str}
     wrongs = []
-    # vary numerator keeping same denominator
     for delta in range(1, den + 5):
         if len(wrongs) >= 4:
             break
@@ -232,13 +221,8 @@ PYTHAGOREAN_TRIPLES = [
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ██████████████████████  QUESTION TEMPLATES  ████████████████████████████████
-# Every answer is computed by Python. Assertions are guards — if one fails the
-# template is silently skipped and another is tried.
+# QUESTION TEMPLATES
 # ─────────────────────────────────────────────────────────────────────────────
-
-
-# ── GEOMETRY ─────────────────────────────────────────────────────────────────
 
 def tpl_rectangle_area():
     a, b, _ = random.choice(PYTHAGOREAN_TRIPLES)
@@ -258,7 +242,7 @@ def tpl_rectangle_area():
 
 
 def tpl_triangle_area_bh():
-    b = random.choice([4,6,8,10,12,14,16,18,20])   # even → integer area
+    b = random.choice([4,6,8,10,12,14,16,18,20])
     h = random.randint(3, 15)
     ans = b * h // 2
     assert b * h % 2 == 0 and b * h // 2 == ans
@@ -280,7 +264,7 @@ def tpl_trapezoid_area():
     while b == a:
         b = random.randint(3, 14)
     if (a + b) % 2 != 0:
-        b += 1          # make sum even → integer area
+        b += 1
     ans = (a + b) // 2 * h
     assert (a + b) % 2 == 0 and (a + b) // 2 * h == ans
     opts, let = make_numeric_options(ans)
@@ -298,7 +282,7 @@ def tpl_trapezoid_area():
 
 def tpl_circle_area():
     r = random.randint(2, 12)
-    base = r * r          # integer coefficient of π
+    base = r * r
     opts, let = make_pi_options(base)
     return {
         "question": f"A circle has radius {r} cm. What is its area? (Give your answer in terms of π.)",
@@ -373,7 +357,7 @@ def tpl_cylinder_volume():
 
 def tpl_sphere_surface_area():
     r = random.randint(2, 8)
-    base = 4 * r * r      # integer coefficient of π
+    base = 4 * r * r
     opts, let = make_pi_options(base)
     return {
         "question": (f"A sphere has radius {r} cm. What is its surface area? "
@@ -543,8 +527,6 @@ def tpl_square_from_perimeter():
         "level": "Junior (JMC)"
     }
 
-
-# ── NUMBER THEORY ─────────────────────────────────────────────────────────────
 
 def tpl_last_digit_power():
     base = random.choice([2, 3, 7, 8])
@@ -730,7 +712,6 @@ def tpl_lcm():
 
 
 def tpl_count_factors():
-    # Verified lookup: n → factorisation string → factor count
     data = [
         (12, "2² × 3",       6),  (18, "2 × 3²",       6),
         (20, "2² × 5",       6),  (24, "2³ × 3",        8),
@@ -823,8 +804,6 @@ def tpl_consecutive_odd_sum():
     }
 
 
-# ── ALGEBRA ───────────────────────────────────────────────────────────────────
-
 def tpl_linear_equation():
     a = random.randint(2, 8)
     x = random.randint(2, 15)
@@ -912,7 +891,6 @@ def tpl_expand_single_bracket():
 
 
 def tpl_simultaneous_equations():
-    # Build equations from solution to guarantee integer answer
     x = random.randint(2, 8)
     y = random.randint(1, 6)
     a1 = random.randint(1, 4)
@@ -920,7 +898,6 @@ def tpl_simultaneous_equations():
     c1 = a1*x + b1*y
     a2 = random.randint(1, 4)
     b2 = random.randint(1, 4)
-    # Ensure not parallel
     for _ in range(20):
         if a1*b2 != a2*b1:
             break
@@ -1016,8 +993,6 @@ def tpl_powers_arithmetic():
     }
 
 
-# ── PERCENTAGE / RATIO ────────────────────────────────────────────────────────
-
 def tpl_percentage_of():
     p = random.choice([10,15,20,25,30,40,50,60,75,80])
     n = random.choice([20,40,60,80,100,120,160,200,240,300,400])
@@ -1053,7 +1028,7 @@ def tpl_reverse_percentage():
 
 
 def tpl_percentage_increase():
-    orig = random.choice([60,80,100,120,160,200,240])  # removed 50,150 (break with p=25)
+    orig = random.choice([60,80,100,120,160,200,240])
     p = random.choice([10,20,25,30,40,50])
     assert orig*(100+p) % 100 == 0
     ans = orig*(100+p)//100
@@ -1124,7 +1099,7 @@ def tpl_speed_time_from_distance():
 
 def tpl_profit_percentage():
     pct = random.choice([10,20,25,30,40,50])
-    cost = random.choice([40,60,80,100,200,400])  # removed 50 (breaks with pct=25)
+    cost = random.choice([40,60,80,100,200,400])
     assert cost*pct % 100 == 0
     profit = cost*pct//100
     selling = cost + profit
@@ -1144,7 +1119,6 @@ def tpl_profit_percentage():
 
 
 def tpl_compound_interest():
-    # Hardcoded combos verified to be exact integers
     combos = [
         (100, 10, 1, 110),  (200, 10, 1, 220),  (500, 10, 1, 550),
         (1000,10, 1, 1100), (100, 20, 1, 120),  (200, 20, 1, 240),
@@ -1153,7 +1127,6 @@ def tpl_compound_interest():
         (100, 50, 2, 225),  (800, 25, 2, 1250),
     ]
     P, r, n, ans = random.choice(combos)
-    # Floating point safe check
     computed = P
     for _ in range(n):
         computed = computed * (100 + r) // 100
@@ -1170,8 +1143,6 @@ def tpl_compound_interest():
         "level": "Intermediate (IMC)"
     }
 
-
-# ── FRACTIONS ─────────────────────────────────────────────────────────────────
 
 def tpl_fraction_add():
     denom_pairs = [(2,3),(2,5),(3,4),(3,5),(4,5),(2,7),(3,7),(4,7),(5,6),(3,8)]
@@ -1194,7 +1165,6 @@ def tpl_fraction_add():
 
 
 def tpl_fraction_multiply():
-    # Pick fractions that simplify nicely
     combos = [
         (2,3,3,4),(3,4,4,5),(2,5,5,6),(3,5,5,9),(2,7,7,8),
         (3,4,8,9),(4,5,5,8),(2,3,3,8),(5,6,6,7),(3,8,4,9),
@@ -1236,8 +1206,6 @@ def tpl_fraction_divide():
     }
 
 
-# ── PROBABILITY / COMBINATORICS ───────────────────────────────────────────────
-
 def tpl_simple_probability():
     r = random.randint(2, 7)
     b = random.randint(2, 7)
@@ -1258,7 +1226,6 @@ def tpl_simple_probability():
 def tpl_probability_complement():
     r = random.randint(2, 8)
     total = random.randint(r+3, 20)
-    # P(not red) = (total-r)/total
     num = total - r
     den = total
     opts, let = make_fraction_options(num, den)
@@ -1305,8 +1272,6 @@ def tpl_combinations():
         "level": "Intermediate (IMC)"
     }
 
-
-# ── STATISTICS ────────────────────────────────────────────────────────────────
 
 def tpl_mean():
     n = 5
@@ -1404,10 +1369,6 @@ def tpl_square_root():
     }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# MASTER TEMPLATE LIST
-# ─────────────────────────────────────────────────────────────────────────────
-
 INTERMEDIATE_SENIOR_TEMPLATES = [
     tpl_trapezoid_area, tpl_cylinder_volume, tpl_sphere_surface_area,
     tpl_interior_angle_polygon, tpl_exterior_angle_polygon,
@@ -1423,7 +1384,6 @@ INTERMEDIATE_SENIOR_TEMPLATES = [
 ]
 
 ALL_TEMPLATES = [
-    # Geometry (18)
     tpl_rectangle_area, tpl_triangle_area_bh, tpl_trapezoid_area,
     tpl_circle_area, tpl_circle_circumference, tpl_cube_surface_area,
     tpl_cube_volume, tpl_cylinder_volume, tpl_sphere_surface_area,
@@ -1431,55 +1391,43 @@ ALL_TEMPLATES = [
     tpl_interior_angle_polygon, tpl_exterior_angle_polygon,
     tpl_triangle_missing_angle, tpl_quadrilateral_missing_angle,
     tpl_distance_two_points, tpl_gradient_two_points, tpl_square_from_perimeter,
-    # Number theory (15)
     tpl_last_digit_power, tpl_sum_first_n, tpl_sum_squares,
     tpl_sum_arithmetic_sequence, tpl_nth_term, tpl_geometric_nth_term,
     tpl_power_of_two_sum, tpl_divisibility_count, tpl_hcf, tpl_lcm,
     tpl_count_factors, tpl_mod_remainder, tpl_factorial_value,
     tpl_factorial_sum, tpl_consecutive_odd_sum,
-    # Algebra (11)
     tpl_linear_equation, tpl_substitute_quadratic, tpl_difference_of_squares,
     tpl_expression_evaluation, tpl_expand_single_bracket,
     tpl_simultaneous_equations, tpl_index_law_multiply, tpl_index_divide,
     tpl_solve_power, tpl_powers_arithmetic, tpl_square_root,
-    # Percentage / ratio / money (8)
     tpl_percentage_of, tpl_reverse_percentage, tpl_percentage_increase,
     tpl_ratio_sharing, tpl_speed_distance_time, tpl_speed_time_from_distance,
     tpl_profit_percentage, tpl_compound_interest,
-    # Fractions (3)
     tpl_fraction_add, tpl_fraction_multiply, tpl_fraction_divide,
-    # Probability / combinatorics (4)
     tpl_simple_probability, tpl_probability_complement,
     tpl_permutations, tpl_combinations,
-    # Statistics (4)
     tpl_mean, tpl_find_missing_for_mean, tpl_median, tpl_range_data,
 ]
-# Total: 63 templates
 
 
 def generate_from_template(exclude_hashes=None):
-    """
-    Try each template in random order.
-    Skip if it generates a duplicate question (by hash).
-    Returns a verified question dict, or None if all fail.
-    """
     if exclude_hashes is None:
         exclude_hashes = set()
     order = (INTERMEDIATE_SENIOR_TEMPLATES * 3 + ALL_TEMPLATES)[:]
     random.shuffle(order)
     for fn in order:
-        for _attempt in range(5):   # 5 fresh random draws per template
+        for _attempt in range(5):
             try:
                 result = fn()
                 if not result:
                     continue
                 h = q_hash(result['question'])
                 if h in exclude_hashes or hash_exists(h):
-                    continue        # already seen — try another draw
+                    continue
                 result['question_hash'] = h
                 return result
             except AssertionError:
-                continue            # template chose bad numbers — retry
+                continue
             except Exception as e:
                 print(f"⚠️ Template {fn.__name__}: {e}")
                 continue
@@ -1487,7 +1435,7 @@ def generate_from_template(exclude_hashes=None):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# AI SYSTEM  (50 % of questions — heavily regulated)
+# AI SYSTEM
 # ─────────────────────────────────────────────────────────────────────────────
 
 UKMT_PROMPT = """You are an expert UKMT question writer with deep knowledge of all past UKMT papers from 1988 to present.
@@ -1545,12 +1493,6 @@ Respond ONLY in this exact JSON (no markdown, no preamble):
 
 
 def safe_eval_verify(expr):
-    """
-    Safely evaluate a verify_expr.
-    Returns True  → expression is True (arithmetic confirmed)
-    Returns False → expression is provably False (wrong answer)
-    Returns None  → expression can't be evaluated safely (can't confirm either way)
-    """
     if not expr or not isinstance(expr, str):
         return None
     try:
@@ -1583,11 +1525,6 @@ def safe_eval_verify(expr):
 
 
 def ai_second_opinion(data):
-    """
-    Ask a SECOND independent AI call to solve the question.
-    Returns (agrees: bool, corrected_data: dict).
-    Always called — not just on failure.
-    """
     try:
         prompt = (
             f"Solve this maths question carefully. Show full working, then give the correct answer letter.\n\n"
@@ -1625,27 +1562,14 @@ def ai_second_opinion(data):
             data['explanation'] = result.get('working', data['explanation'])
             return False, data
 
-        return True, data   # can't determine — trust original
+        return True, data
 
     except Exception as e:
         print(f"⚠️ Second opinion exception: {e}")
-        return True, data   # if second opinion crashes, accept original
+        return True, data
 
 
 def generate_ai_question(level, exclude_hashes=None):
-    """
-    Generate a question using AI.
-    Regulation pipeline:
-      1. Must return valid JSON with all fields + verify_expr
-      2. Python evaluates verify_expr
-         - True  → second opinion still called (always)
-         - False → second opinion called, auto-correct attempted
-         - None  → second opinion called
-      3. Second opinion must agree (or auto-correct)
-      4. Re-verify after any correction
-      5. Uniqueness check
-      6. Up to 5 attempts before giving up
-    """
     if exclude_hashes is None:
         exclude_hashes = set()
 
@@ -1662,7 +1586,6 @@ def generate_ai_question(level, exclude_hashes=None):
                 raw = raw[raw.index('{'):raw.rindex('}')+1]
             data = json.loads(raw)
 
-            # --- Sanity: all required fields present ---
             required = ['question','option_a','option_b','option_c','option_d',
                         'option_e','answer','explanation','verify_expr']
             if not all(data.get(k) for k in required):
@@ -1672,26 +1595,21 @@ def generate_ai_question(level, exclude_hashes=None):
                 print(f"⚠️ Attempt {attempt+1}: bad answer letter")
                 continue
 
-            # --- Step 1: Python verify_expr ---
             v1 = safe_eval_verify(data.get('verify_expr', ''))
             if v1 is False:
                 print(f"⚠️ Attempt {attempt+1}: verify_expr=False → sending to second opinion")
 
-            # --- Step 2: Second opinion (ALWAYS) ---
             agreed, data = ai_second_opinion(data)
 
-            # --- Step 3: Re-verify after potential correction ---
             if not agreed:
                 v2 = safe_eval_verify(data.get('verify_expr', ''))
                 if v2 is False:
                     print(f"⚠️ Attempt {attempt+1}: still wrong after correction. Retrying.")
                     continue
             elif v1 is False:
-                # verify failed but second opinion agreed — still reject
                 print(f"⚠️ Attempt {attempt+1}: verify False + second agrees but math wrong. Retrying.")
                 continue
 
-            # --- Step 4: Uniqueness ---
             h = q_hash(data['question'])
             if h in exclude_hashes or hash_exists(h):
                 print(f"ℹ️ Attempt {attempt+1}: duplicate question, retrying.")
@@ -1725,12 +1643,6 @@ def pick_level():
 # ─────────────────────────────────────────────────────────────────────────────
 
 def generate_question():
-    """
-    50 % template (Python-verified, arithmetically perfect, 63 templates).
-    50 % AI (verify_expr + second opinion + uniqueness check).
-    Guaranteed fallback to template if AI fails.
-    Guaranteed unique question every day.
-    """
     today = date.today().isoformat()
     conn = get_db()
     existing = conn.execute(
@@ -1774,21 +1686,45 @@ def generate_question():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DISCORD WEBHOOK
+# DISCORD / RCON HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
+
 def run_rcon(command):
-    """Send a command to the Minecraft server via RCON. Returns output or None."""
+    """Only used for 'list' to check online status."""
     if not RCON_HOST or not RCON_PASSWORD:
-        print("⚠️ RCON not configured — skipping command")
         return None
     try:
         from mcrcon import MCRcon
         with MCRcon(RCON_HOST, RCON_PASSWORD, port=RCON_PORT) as mcr:
-            response = mcr.command(command)
-            return response
+            return mcr.command(command)
     except Exception as e:
         print(f"❌ RCON error: {e}")
         return None
+
+
+def send_console_command(command):
+    """Send a plain command to DiscordSRV console channel → executed on server."""
+    if not DISCORD_BOT_TOKEN or not DISCORD_CONSOLE_CHANNEL_ID:
+        print("⚠️ Discord bot not configured — skipping command")
+        return False
+    import requests as req
+    url = f"https://discord.com/api/v10/channels/{DISCORD_CONSOLE_CHANNEL_ID}/messages"
+    try:
+        r = req.post(
+            url,
+            json={"content": command},
+            headers={
+                "Authorization": f"Bot {DISCORD_BOT_TOKEN}",
+                "Content-Type": "application/json"
+            },
+            timeout=5
+        )
+        if r.status_code not in (200, 201):
+            print(f"❌ Discord API error: {r.status_code} {r.text}")
+        return r.status_code in (200, 201)
+    except Exception as e:
+        print(f"❌ send_console_command error: {e}")
+        return False
 
 
 def get_player_streak(mc_username):
@@ -1804,12 +1740,6 @@ def get_player_streak(mc_username):
 
 
 def update_player_streak(mc_username, correct, today):
-    """
-    Update streak for player.
-    correct=True  → increment streak (or start at 1 if they missed yesterday)
-    correct=False → reset to 0
-    Returns new streak value.
-    """
     conn = get_db()
     row = conn.execute(
         'SELECT current_streak, last_correct FROM player_streaks WHERE mc_username = ?',
@@ -1834,10 +1764,8 @@ def update_player_streak(mc_username, correct, today):
     elif row['last_correct'] == yesterday:
         new_streak = row['current_streak'] + 1
     elif row['last_correct'] == today:
-        # Already updated today somehow
         new_streak = row['current_streak']
     else:
-        # Missed a day — reset streak to 1
         new_streak = 1
 
     conn.execute(
@@ -1858,12 +1786,10 @@ def is_player_online(mc_username):
     response = run_rcon("list")
     if response is None:
         return False
-    # "list" returns e.g. "There are 3 of a max of 20 players online: Steve, Alex, Notch"
     return mc_username.lower() in response.lower()
 
 
 def store_pending_reward(mc_username, streak, reward):
-    """Queue a reward for offline delivery."""
     conn = get_db()
     conn.execute(
         '''INSERT OR REPLACE INTO pending_rewards
@@ -1874,70 +1800,65 @@ def store_pending_reward(mc_username, streak, reward):
     )
     conn.commit()
     conn.close()
-    print(f"⏳ Reward queued for offline player {mc_username}: {reward['label']}")
-
-
-def deliver_pending_rewards(mc_username):
-    """Deliver any queued rewards for a player who is now online."""
-    conn = get_db()
-    rows = conn.execute(
-        'SELECT * FROM pending_rewards WHERE mc_username = ?',
-        (mc_username,)
-    ).fetchall()
-    conn.close()
-
-    for row in rows:
-        give_cmd = f"give {mc_username} minecraft:{row['item']} {row['amount']}"
-        earned = row['earned_date']
-        label = row['label']
-        msg_cmd  = (
-            f'tellraw {mc_username} [{{"text":"[BrainBrawl] ","color":"gold","bold":true}},'
-            f'{{"text":"Pending reward from {earned}: {label}","color":"yellow"}}]'
-        )
-        run_rcon(give_cmd)
-        run_rcon(msg_cmd)
-        print(f"✅ Delivered pending reward to {mc_username}: {row['label']}")
-
-    if rows:
-        conn = get_db()
-        conn.execute(
-            'DELETE FROM pending_rewards WHERE mc_username = ?', (mc_username,)
-        )
-        conn.commit()
-        conn.close()
+    print(f"⏳ Reward queued for {mc_username}: {reward['label']}")
 
 
 def give_streak_reward(mc_username, streak):
-    """
-    Give the reward for this streak day via RCON.
-    If player is offline, queues the reward for delivery next time they're online.
-    """
+    """Always queue reward; deliver automatically when player comes online."""
     idx    = min(streak, 7) - 1
     reward = STREAK_REWARDS[idx]
+    store_pending_reward(mc_username, streak, reward)
+    print(f"⏳ Reward queued for {mc_username}: {reward['label']} (streak {streak})")
 
-    if not is_player_online(mc_username):
-        store_pending_reward(mc_username, streak, reward)
-        print(f"⚠️ {mc_username} is offline — reward queued")
+
+def deliver_pending_rewards(mc_username):
+    """Deliver queued rewards via DiscordSRV console channel. Reset streak if day 7 claimed."""
+    conn = get_db()
+    rows = conn.execute(
+        'SELECT * FROM pending_rewards WHERE mc_username = ?', (mc_username,)
+    ).fetchall()
+    conn.close()
+
+    if not rows:
         return
 
-    give_cmd = f"give {mc_username} minecraft:{reward['item']} {reward['amount']}"
-    reward_label = reward['label']
-    msg_cmd  = (
-        f'tellraw {mc_username} [{{"text":"[BrainBrawl] ","color":"gold","bold":true}},'
-        f'{{"text":"Day {streak} streak! You earned: {reward_label}","color":"yellow"}}]'
-    )
-    run_rcon(give_cmd)
-    run_rcon(msg_cmd)
-    print(f"✅ RCON: gave {mc_username} {reward['label']} (streak day {streak})")
+    max_streak = 0
+    for row in rows:
+        give_cmd = f"give {mc_username} minecraft:{row['item']} {row['amount']}"
+        msg_cmd  = (
+            f'tellraw {mc_username} [{{"text":"[BrainBrawl] ","color":"gold","bold":true}},'
+            f'{{"text":"Day {row["streak"]} streak reward: {row["label"]}!","color":"yellow"}}]'
+        )
+        send_console_command(give_cmd)
+        send_console_command(msg_cmd)
+        print(f"✅ Delivered to {mc_username}: {row['label']}")
+        if row['streak'] > max_streak:
+            max_streak = row['streak']
+
+    conn = get_db()
+    conn.execute('DELETE FROM pending_rewards WHERE mc_username = ?', (mc_username,))
+    conn.commit()
+
+    if max_streak >= 7:
+        conn.execute(
+            'UPDATE player_streaks SET current_streak = 0 WHERE mc_username = ?',
+            (mc_username,)
+        )
+        conn.commit()
+        send_console_command(
+            f'tellraw {mc_username} [{{"text":"[BrainBrawl] ","color":"gold","bold":true}},'
+            f'{{"text":"You completed a full 7-day streak! Streak reset — go again!","color":"aqua"}}]'
+        )
+        print(f"🔄 Streak reset for {mc_username} after day 7 claim")
+
+    conn.close()
 
 
 def send_wrong_answer_message(mc_username):
-    """Send a consolation message for a wrong answer."""
-    msg_cmd = (
+    send_console_command(
         f'tellraw {mc_username} [{{"text":"[BrainBrawl] ","color":"red","bold":true}},'
-        f'{{"text":"Better luck next time! Your streak has been reset.","color":"white"}}]'
+        f'{{"text":"Wrong answer! Your streak has been reset.","color":"white"}}]'
     )
-    run_rcon(msg_cmd)
 
 
 def send_discord(mc_username, discord_username, answer, is_correct, question_text, date_str):
@@ -1964,7 +1885,6 @@ def send_discord(mc_username, discord_username, answer, is_correct, question_tex
     }
     try:
         req.post(DISCORD_WEBHOOK, json=payload, timeout=5)
-        print(f"Discord webhook status: {r.status_code} — {r.text}")
     except Exception as e:
         print(f"⚠️ Discord webhook failed: {e}")
 
@@ -1975,8 +1895,10 @@ def send_discord(mc_username, discord_username, answer, is_correct, question_tex
 
 scheduler = BackgroundScheduler()
 scheduler.add_job(generate_question, 'cron', hour=0, minute=1)
+
+
 def check_and_deliver_pending():
-    """Every 5 minutes, check if any offline-rewarded players are now online."""
+    """Every 5 minutes, deliver rewards to any pending players who are now online."""
     conn = get_db()
     pending = conn.execute(
         'SELECT DISTINCT mc_username FROM pending_rewards'
@@ -1986,6 +1908,7 @@ def check_and_deliver_pending():
         username = row['mc_username']
         if is_player_online(username):
             deliver_pending_rewards(username)
+
 
 scheduler.add_job(check_and_deliver_pending, 'interval', minutes=5)
 scheduler.start()
@@ -2093,7 +2016,6 @@ def submit():
     send_discord(mc_username, discord_username, answer,
                  bool(is_correct), q['question'], today)
 
-    # ── STREAK & RCON REWARDS ────────────────────────────────────────────────
     new_streak = update_player_streak(mc_username, bool(is_correct), today)
 
     if is_correct:
@@ -2111,9 +2033,9 @@ def submit():
         'reward':       reward_label,
     })
 
+
 @app.route('/claim/<mc_username>')
 def claim_reward(mc_username):
-    """Player visits this to manually claim any pending reward."""
     if not is_player_online(mc_username):
         return jsonify({
             'success': False,
@@ -2122,10 +2044,12 @@ def claim_reward(mc_username):
     deliver_pending_rewards(mc_username)
     return jsonify({'success': True, 'message': 'Rewards delivered!'})
 
+
 @app.route('/streak/<mc_username>')
 def get_streak(mc_username):
     streak, last = get_player_streak(mc_username)
     return jsonify({'streak': streak, 'last_correct': last})
+
 
 @app.route('/pending-rewards-list')
 def pending_rewards_list():
@@ -2152,6 +2076,7 @@ def pending_rewards_list():
     for r in result:
         lines.append(f"{r['mc_username']} | {r['label']} | Discord: {r['discord_username']} | {r['earned_date']}")
     return "\n".join(lines)
+
 
 @app.route('/leaderboard')
 def leaderboard():
