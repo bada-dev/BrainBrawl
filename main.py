@@ -1490,25 +1490,44 @@ def generate_from_template(exclude_hashes=None):
 # AI SYSTEM  (50 % of questions — heavily regulated)
 # ─────────────────────────────────────────────────────────────────────────────
 
-UKMT_PROMPT = """You are an expert UKMT question writer with deep knowledge of all past UKMT papers.
-You work for BrainBrawl.
+UKMT_PROMPT = """You are an expert UKMT question writer with deep knowledge of all past UKMT papers from 1988 to present.
+
 Generate ONE original UKMT-style multiple choice question at level: {level}
+
+WHAT MAKES A REAL UKMT QUESTION:
+- It has a CLEVER TRICK or elegant insight that makes it easy once you see it
+- A student who just blindly calculates will likely get it wrong or take too long
+- The best students solve it in under 60 seconds using pattern recognition or a shortcut
+- Topics: number patterns, clever algebra, geometry with a twist, clever counting, modular arithmetic, sequences with a trick
+
+GOOD UKMT QUESTION TYPES:
+- "What is 1×2 + 2×3 + 3×4 + ... + 99×100?" (telescoping or formula insight)
+- "How many integers from 1-1000 have digit sum equal to 5?" (counting with structure)
+- "A square is inscribed in a right triangle. What fraction of the triangle is the square?" (geometry insight)
+- "What is the last digit of 7^2025?" (cyclicity)
+- "The sum of 5 consecutive odd numbers is 235. What is the largest?" (algebraic shortcut)
+- "How many ways can you write 12 as an ordered sum of positive integers?" (combinatorics insight)
+- "What is 2025 × 2025 - 2024 × 2026?" (difference of squares trick)
+
+BAD UKMT QUESTION TYPES (DO NOT USE):
+- "What is 2/5 × 5/6?" (just arithmetic, no insight)
+- "What is 15% of 240?" (just arithmetic)
+- "Solve 3x + 7 = 25" (just algebra, no insight)
+- "What is the area of a rectangle with length 6 and width 8?" (formula plugging)
+- Any question that just asks to apply a formula directly
 
 ABSOLUTE REQUIREMENTS:
 1. Exactly 5 options A–E, exactly one correct.
-2. UKMT style: elegant, requires insight or a clever trick — not just blind calculation.
-3. Triple-check your arithmetic. Then check again.
-4. You MUST provide a verify_expr: a standalone Python expression that evaluates to True
-   when the answer is correct. Use only basic Python maths.
+2. The question MUST require insight, not just calculation.
+3. Triple-check your arithmetic.
+4. Distractors must be the answers students get from common MISTAKES or wrong approaches.
+5. You MUST provide a verify_expr: a Python expression that evaluates to True when correct.
+6. VARY the answer letter — do not always use A.
 
-   Good examples:
-   - "12 * 14 == 168"
-   - "(5**2 + 12**2)**0.5 == 13.0"
-   - "(8-2)*180 // 8 == 135"
-   - "sum(range(1,101)) == 5050"
-   - "(1000 - 100*3) % 7 == 2"
-
-5. Distractors must be PLAUSIBLE — common mistakes should lead to them.
+Good verify_expr examples:
+- "2025**2 - 2024*2026 == 1"
+- "sum(i*(i+1) for i in range(1,100)) == 328350"
+- "(7**2025) % 10 == 7"
 
 Respond ONLY in this exact JSON (no markdown, no preamble):
 {{
@@ -1518,8 +1537,8 @@ Respond ONLY in this exact JSON (no markdown, no preamble):
   "option_c": "...",
   "option_d": "...",
   "option_e": "...",
-  "answer": "A",
-  "explanation": "clear step-by-step solution showing why others are wrong",
+  "answer": "B",
+  "explanation": "explain the TRICK or INSIGHT that makes this easy, not just the calculation",
   "verify_expr": "python expression → True",
   "level": "{level}"
 }}"""
@@ -1872,7 +1891,7 @@ def deliver_pending_rewards(mc_username):
         earned = row['earned_date']
         label = row['label']
         msg_cmd  = (
-            f'tellraw {mc_username} [{{"text":"[UKMT] ","color":"gold","bold":true}},'
+            f'tellraw {mc_username} [{{"text":"[BrainBrawl] ","color":"gold","bold":true}},'
             f'{{"text":"Pending reward from {earned}: {label}","color":"yellow"}}]'
         )
         run_rcon(give_cmd)
@@ -1904,7 +1923,7 @@ def give_streak_reward(mc_username, streak):
     give_cmd = f"give {mc_username} minecraft:{reward['item']} {reward['amount']}"
     reward_label = reward['label']
     msg_cmd  = (
-        f'tellraw {mc_username} [{{"text":"[UKMT] ","color":"gold","bold":true}},'
+        f'tellraw {mc_username} [{{"text":"[BrainBrawl] ","color":"gold","bold":true}},'
         f'{{"text":"Day {streak} streak! You earned: {reward_label}","color":"yellow"}}]'
     )
     run_rcon(give_cmd)
@@ -1915,7 +1934,7 @@ def give_streak_reward(mc_username, streak):
 def send_wrong_answer_message(mc_username):
     """Send a consolation message for a wrong answer."""
     msg_cmd = (
-        f'tellraw {mc_username} [{{"text":"[UKMT] ","color":"red","bold":true}},'
+        f'tellraw {mc_username} [{{"text":"[BrainBrawl] ","color":"red","bold":true}},'
         f'{{"text":"Better luck next time! Your streak has been reset.","color":"white"}}]'
     )
     run_rcon(msg_cmd)
