@@ -2145,7 +2145,12 @@ def pending_rewards_list():
             'earned_date': row['earned_date']
         })
     conn.close()
-    return jsonify(result)
+    if not result:
+        return "NO_REWARDS"
+    lines = []
+    for r in result:
+        lines.append(f"{r['mc_username']} | {r['label']} | Discord: {r['discord_username']} | {r['earned_date']}")
+    return "\n".join(lines)
 
 @app.route('/leaderboard')
 def leaderboard():
