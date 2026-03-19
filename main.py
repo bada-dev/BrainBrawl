@@ -1964,6 +1964,7 @@ def send_discord(mc_username, discord_username, answer, is_correct, question_tex
     }
     try:
         req.post(DISCORD_WEBHOOK, json=payload, timeout=5)
+        print(f"Discord webhook status: {r.status_code} — {r.text}")
     except Exception as e:
         print(f"⚠️ Discord webhook failed: {e}")
 
