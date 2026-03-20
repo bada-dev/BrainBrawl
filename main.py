@@ -1384,29 +1384,31 @@ INTERMEDIATE_SENIOR_TEMPLATES = [
 ]
 
 ALL_TEMPLATES = [
-    tpl_rectangle_area, tpl_triangle_area_bh, tpl_trapezoid_area,
-    tpl_circle_area, tpl_circle_circumference, tpl_cube_surface_area,
+    # Geometry — kept harder ones, removed pure formula plugs
+    tpl_triangle_area_bh, tpl_trapezoid_area,
     tpl_cube_volume, tpl_cylinder_volume, tpl_sphere_surface_area,
     tpl_right_triangle_hypotenuse, tpl_right_triangle_leg,
     tpl_interior_angle_polygon, tpl_exterior_angle_polygon,
-    tpl_triangle_missing_angle, tpl_quadrilateral_missing_angle,
-    tpl_distance_two_points, tpl_gradient_two_points, tpl_square_from_perimeter,
+    tpl_distance_two_points, tpl_gradient_two_points,
+    # Number theory
     tpl_last_digit_power, tpl_sum_first_n, tpl_sum_squares,
     tpl_sum_arithmetic_sequence, tpl_nth_term, tpl_geometric_nth_term,
     tpl_power_of_two_sum, tpl_divisibility_count, tpl_hcf, tpl_lcm,
     tpl_count_factors, tpl_mod_remainder, tpl_factorial_value,
     tpl_factorial_sum, tpl_consecutive_odd_sum,
-    tpl_linear_equation, tpl_substitute_quadratic, tpl_difference_of_squares,
-    tpl_expression_evaluation, tpl_expand_single_bracket,
+    # Algebra — removed trivial ones
+    tpl_substitute_quadratic, tpl_difference_of_squares,
     tpl_simultaneous_equations, tpl_index_law_multiply, tpl_index_divide,
-    tpl_solve_power, tpl_powers_arithmetic, tpl_square_root,
-    tpl_percentage_of, tpl_reverse_percentage, tpl_percentage_increase,
+    # Percentage / ratio
+    tpl_reverse_percentage, tpl_percentage_increase,
     tpl_ratio_sharing, tpl_speed_distance_time, tpl_speed_time_from_distance,
     tpl_profit_percentage, tpl_compound_interest,
-    tpl_fraction_add, tpl_fraction_multiply, tpl_fraction_divide,
-    tpl_simple_probability, tpl_probability_complement,
-    tpl_permutations, tpl_combinations,
-    tpl_mean, tpl_find_missing_for_mean, tpl_median, tpl_range_data,
+    # Fractions — kept harder ones
+    tpl_fraction_multiply, tpl_fraction_divide,
+    # Probability / combinatorics
+    tpl_probability_complement, tpl_permutations, tpl_combinations,
+    # Statistics — kept slightly harder ones
+    tpl_find_missing_for_mean, tpl_median, tpl_range_data,
 ]
 
 
