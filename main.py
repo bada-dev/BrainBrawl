@@ -1459,12 +1459,16 @@ GOOD UKMT QUESTION TYPES:
 - "How many ways can you write 12 as an ordered sum of positive integers?" (combinatorics insight)
 - "What is 2025 × 2025 - 2024 × 2026?" (difference of squares trick)
 
-BAD UKMT QUESTION TYPES (DO NOT USE):
+BAD UKMT QUESTION TYPES (DO NOT USE — EVER):
 - "What is 2/5 × 5/6?" (just arithmetic, no insight)
 - "What is 15% of 240?" (just arithmetic)
 - "Solve 3x + 7 = 25" (just algebra, no insight)
 - "What is the area of a rectangle with length 6 and width 8?" (formula plugging)
 - Any question that just asks to apply a formula directly
+- BANNED: Any version of "a bat and a ball cost £X together, the bat costs £Y more than the ball" — this is a massively overused trick question, never use it or any variant
+- BANNED: Any version of "find the sum of integers from 1 to N that are not divisible by X or Y" — boring and overused
+- BANNED: Any question whose insight is just "the obvious answer is wrong by a small amount" (bat/ball style gotchas)
+- BANNED: Any question that is famous or well-known outside of UKMT (e.g. classic puzzle book problems)
 
 ABSOLUTE REQUIREMENTS:
 1. Exactly 5 options A–E, exactly one correct.
